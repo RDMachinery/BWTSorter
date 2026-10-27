@@ -2,7 +2,7 @@
 
 This document describes how BWTSorter works internally: the compression pipeline, the algorithms behind each stage, the on-disk format, the design trade-offs, and how it compares with bzip2 and xz. It is aimed at developers and the curious. For usage instructions, see [README.md](README.md).
 
-BWTSorter is a single-file Java program (`BWTSorter.java`, about 710 lines, no dependencies beyond the JDK). It is a block-sorting compressor, related to `bzip2` but with a modern back end: a linear-time suffix sort, large blocks, and a context-mixing model driving an arithmetic coder. This places it in the same family as `bsc` and `bcm`.
+BWTSorter is a single-file Java program (`BWTSorter.java`, about 710 lines, no dependencies beyond the JDK). It is a block-sorting compressor, related to `bzip2` but with a modern back end: a linear-time suffix sort, large blocks, and a context-mixing model driving an arithmetic coder. This places it in the same family as `bsc` and `bcm`; on the Silesia corpus it produces the smallest total of all the popular compressors tested (§10).
 
 ---
 
@@ -18,7 +18,7 @@ BWTSorter is a single-file Java program (`BWTSorter.java`, about 710 lines, no d
 8. [Integrity and error handling](#8-integrity-and-error-handling)
 9. [Complexity and memory](#9-complexity-and-memory)
 10. [Benchmarks](#10-benchmarks)
-11. [Why it beats xz on some files and not others](#11-why-it-beats-xz-on-some-files-and-not-others)
+11. [Why it wins on some files and not others](#11-why-it-wins-on-some-files-and-not-others)
 12. [How the model was tuned](#12-how-the-model-was-tuned)
 13. [Version history](#13-version-history)
 14. [Limitations and possible extensions](#14-limitations-and-possible-extensions)
@@ -280,43 +280,78 @@ Unlike the sort, the model's cost is the same per byte regardless of content. It
 
 ## 10. Benchmarks
 
-All results are on the **Silesia corpus**, the standard benchmark for general-purpose compressors: 12 files, 211.9 MB, covering English text, a dictionary, XML, source code, databases, executables, medical images and astronomical data. Each file was compressed and decompressed separately, and every BWTSorter output was compared byte-for-byte with the original. All 12 round-tripped correctly.
+All results are on the **Silesia corpus**, the standard benchmark for general-purpose compressors: 12 files, 211.9 MB, covering English text, a dictionary, XML, source code, databases, executables, medical images and astronomical data. Each file was compressed and decompressed separately with every tool. Every output was compared byte-for-byte with the original, and all 144 round-trips succeeded.
 
-The tools compared were BWTSorter with default settings (32 MB blocks, default JVM heap), `bzip2 -9`, and `xz -9e -T1` (xz's strongest preset, single-threaded). Everything ran on a 2-core Linux cloud VM with OpenJDK 21.
+### The contenders
 
-### Compressed size (bytes; smallest in bold)
+Each tool was run at its strongest standard setting and **single-threaded**, since BWTSorter is single-threaded.
 
-| File | Contents | Original | BWTSorter | bzip2 -9 | xz -9e | vs xz |
-|---|---|---|---|---|---|---|
-| dickens | English novels | 10,192,446 | **2,254,513** | 2,799,520 | 2,831,212 | −20.4% |
-| mozilla | Tarred executables | 51,220,480 | 15,992,950 | 17,914,392 | **13,376,240** | +19.6% |
-| mr | MRI image | 9,970,564 | **2,112,249** | 2,441,280 | 2,751,892 | −23.2% |
-| nci | Chemical database | 33,553,445 | **1,235,199** | 1,812,734 | 1,449,272 | −14.8% |
-| ooffice | x86 DLL | 6,152,192 | 2,546,137 | 2,862,526 | **2,427,224** | +4.9% |
-| osdb | Database records | 10,085,684 | **2,194,465** | 2,802,792 | 2,844,556 | −22.9% |
-| reymont | Polish novel (PDF text) | 6,627,202 | **988,049** | 1,246,230 | 1,315,592 | −24.9% |
-| samba | Tarred source code | 21,606,400 | 3,943,855 | 4,549,759 | **3,739,524** | +5.5% |
-| sao | Star catalogue (binary) | 7,251,944 | 4,664,269 | 4,940,524 | **4,425,664** | +5.4% |
-| webster | Dictionary | 41,458,703 | **6,638,224** | 8,644,714 | 8,368,672 | −20.7% |
-| x-ray | X-ray image | 8,474,240 | **3,647,928** | 4,051,112 | 4,491,264 | −18.8% |
-| xml | XML documents | 5,345,280 | **392,043** | 441,186 | 434,892 | −9.9% |
-| **Total** | | **211,938,580** | **46,609,881** | 54,506,769 | 48,456,004 | **−3.8%** |
+| Tool | Version | Setting | Family |
+|---|---|---|---|
+| **BWTSorter** | 3 | defaults (32 MB blocks) | BWT + context mixing |
+| bsc | 3.4.0 | `-b32e2`, and `-b32pe2` (preprocessing off) | BWT + adaptive QLFC; the state of the art in block sorting |
+| 7-Zip PPMd | 26.05 | `-m0=PPMd -mx9` | Prediction by partial matching |
+| xz | 5.4.5 | `-9e -T1` | LZMA2 |
+| 7-Zip LZMA2 | 26.05 | `-mx9 -mmt1` | LZMA2 (7-Zip's own encoder, with automatic executable filters) |
+| brotli | 1.2.0 | `-q 11 -w 24` | LZ77 + context modelling (used on the web) |
+| zstd | 1.6.0 | `-19`, and `--ultra -22` | LZ77 + finite-state entropy |
+| bzip2 | 1.0.8 | `-9` | BWT + Huffman |
+| gzip | 1.12 | `-9` | Deflate (the same method as `.zip`) |
+| lz4 | 1.10.1 | `-12` (HC) | LZ77, built for speed |
 
-Compression ratio over the whole corpus: **BWTSorter 4.55**, xz 4.37, bzip2 3.89.
+Everything ran on a 2-core Linux cloud VM, with BWTSorter on OpenJDK 21. Absolute speeds will differ on other machines, but the ratios between tools should hold roughly.
 
-BWTSorter produces the smallest file on **8 of the 12** files. Its total is 14.5% smaller than bzip2's and 3.8% smaller than xz's.
+### Whole corpus
 
-### Speed (whole corpus, seconds)
+Ranked by total compressed size (smaller is better):
 
-| | Compress | Decompress |
-|---|---|---|
-| BWTSorter | 148 (1.4 MB/s) | 147 (1.4 MB/s) |
-| bzip2 -9 | 20 | — |
-| xz -9e | 205 | — |
+| Rank | Tool | Total size | Ratio | Compress | Decompress |
+|---|---|---|---|---|---|
+| 1 | **BWTSorter** | **46,609,881** | **4.55** | 1.4 MB/s | 1.4 MB/s |
+| 2 | bsc `-b32e2` | 46,789,246 | 4.53 | 14.0 MB/s | 15.2 MB/s |
+| 3 | bsc `-b32pe2` | 46,898,896 | 4.52 | 13.6 MB/s | 15.1 MB/s |
+| 4 | 7-Zip PPMd | 47,684,664 | 4.44 | 3.5 MB/s | 3.5 MB/s |
+| 5 | xz `-9e` | 48,456,004 | 4.37 | 1.0 MB/s | 56 MB/s |
+| 6 | 7-Zip LZMA2 | 48,757,480 | 4.35 | 1.5 MB/s | 61 MB/s |
+| 7 | brotli `-q 11` | 49,564,563 | 4.28 | 0.4 MB/s | 194 MB/s |
+| 8 | zstd `--ultra -22` | 52,369,178 | 4.05 | 1.1 MB/s | 349 MB/s |
+| 9 | zstd `-19` | 52,895,350 | 4.01 | 1.5 MB/s | 412 MB/s |
+| 10 | bzip2 `-9` | 54,506,769 | 3.89 | 11.1 MB/s | 21 MB/s |
+| 11 | gzip `-9` | 67,631,990 | 3.13 | 9.5 MB/s | 125 MB/s |
+| 12 | lz4 `-12` | 77,375,887 | 2.74 | 9.0 MB/s | 165 MB/s |
 
-Decompression times for bzip2 and xz weren't measured. Typically bzip2 decompresses at roughly twice its compression speed, and xz at 50–100 MB/s.
+Speeds are the original size divided by the total wall-clock time over all 12 files, including process start-up (which costs BWTSorter about 0.1 s per file for the JVM).
 
-BWTSorter compresses faster than `xz -9e` but decompresses far more slowly, because its model must be re-run in full to decode (see §9). This is the standard trade-off of context-mixing compressors: a better ratio in exchange for symmetric, slower decoding.
+**BWTSorter produces the smallest total of all.** It is 0.4% smaller than bsc, 2.3% smaller than PPMd, 3.8% smaller than xz, 6% smaller than brotli, 11% smaller than zstd at its maximum setting, 14.5% smaller than bzip2 and 31% smaller than gzip.
+
+### File by file
+
+Compressed size in bytes. The smallest among the columns shown is in **bold**. The last column names the winner across all twelve configurations tested.
+
+| File | Contents | BWTSorter | bsc `-b32e2` | PPMd | xz | brotli | zstd `-22` | bzip2 | gzip | Best of all |
+|---|---|---|---|---|---|---|---|---|---|---|
+| dickens | English novels | **2,254,513** | 2,259,134 | 2,280,125 | 2,831,212 | 2,827,777 | 2,849,068 | 2,799,520 | 3,851,823 | BWTSorter |
+| mozilla | Tarred executables | 15,992,950 | 16,001,774 | 15,911,902 | **13,376,240** | 13,872,265 | 14,914,120 | 17,914,392 | 18,994,142 | 7-Zip LZMA2 |
+| mr | MRI image | **2,112,249** | 2,206,012 | 2,320,767 | 2,751,892 | 2,823,136 | 3,102,402 | 2,441,280 | 3,673,940 | BWTSorter |
+| nci | Chemical database | 1,235,199 | **1,210,336** | 1,484,569 | 1,449,272 | 1,519,768 | 1,579,587 | 1,812,734 | 2,987,533 | bsc `-b32pe2` |
+| ooffice | x86 DLL | 2,546,137 | 2,559,108 | 2,496,139 | **2,427,224** | 2,478,855 | 2,595,256 | 2,862,526 | 3,090,442 | 7-Zip LZMA2 |
+| osdb | Database records | **2,194,465** | 2,224,780 | 2,384,175 | 2,844,556 | 2,816,278 | 3,100,124 | 2,802,792 | 3,716,342 | BWTSorter |
+| reymont | Polish novel (PDF text) | 988,049 | **982,364** | 1,054,299 | 1,315,592 | 1,332,158 | 1,348,522 | 1,246,230 | 1,820,834 | bsc `-b32e2` |
+| samba | Tarred source code | 3,943,855 | 3,909,928 | 3,815,315 | **3,739,524** | 3,766,340 | 3,866,386 | 4,549,759 | 5,408,272 | xz |
+| sao | Star catalogue (binary) | 4,664,269 | 4,679,764 | 4,783,825 | **4,425,664** | 4,586,092 | 5,000,576 | 4,940,524 | 5,327,041 | 7-Zip LZMA2 |
+| webster | Dictionary | 6,638,224 | **6,606,282** | 6,942,891 | 8,368,672 | 8,428,575 | 8,431,645 | 8,644,714 | 12,061,624 | bsc `-b32pe2` |
+| x-ray | X-ray image | **3,647,928** | 3,756,584 | 3,850,893 | 4,491,264 | 4,682,753 | 5,129,828 | 4,051,112 | 6,037,713 | BWTSorter |
+| xml | XML documents | 392,043 | 393,180 | **359,764** | 434,892 | 430,566 | 451,664 | 441,186 | 662,284 | 7-Zip PPMd |
+| **Total** | | **46,609,881** | 46,789,246 | 47,684,664 | 48,456,004 | 49,564,563 | 52,369,178 | 54,506,769 | 67,631,990 | **BWTSorter** |
+
+Wins across all twelve configurations: BWTSorter 4 files, bsc 3 (between its two settings), 7-Zip LZMA2 3, xz 1, PPMd 1.
+
+### What the numbers say
+
+- **Against bsc**, the closest relative and the strongest block-sorting compressor available, BWTSorter is level on ratio. It is clearly ahead on the images and the binary database (mr, x-ray, osdb, by 1–4%), and slightly behind on the large text files (webster, nci, reymont, by 0.5–2%). The like-for-like comparison is `-b32pe2`: the same transform and block size with preprocessing off, so only the back end differs. BWTSorter's total is 0.6% smaller. bsc is, however, **about ten times faster** in both directions. Its entropy coder (quantized local frequency coding) does far less work per byte than a bit-level context-mixing model, and it is optimised C++.
+- **Against the LZ family** (xz, 7-Zip LZMA2, brotli, zstd, gzip, lz4), BWTSorter compresses text, data and images much better: 10–25% smaller than the best LZ result on each of those 8 files. It loses on executables and code tarballs (see §11). Every LZ tool decompresses vastly faster, at 50–400 MB/s against 1.4 MB/s. That is why LZ dominates software distribution, where a file is compressed once and decompressed millions of times.
+- **Against PPMd**, the other classic statistical approach, BWTSorter wins on 8 of 12 files and overall. PPMd's one standout is XML, where its long, variable-order contexts capture tag structure especially well.
+- **Speed.** BWTSorter's compression speed is in the same band as the maximum settings of xz, LZMA2, zstd and brotli (0.4–1.5 MB/s), and faster than brotli `-q 11` by 3.5×. Its decompression is the slowest of the group.
 
 ### Smaller synthetic tests
 
@@ -329,15 +364,17 @@ BWTSorter compresses faster than `xz -9e` but decompresses far more slowly, beca
 
 ---
 
-## 11. Why it beats xz on some files and not others
+## 11. Why it wins on some files and not others
 
-**Where BWTSorter wins** (text, dictionaries, databases, images; 8 files, −10% to −25%): this data is dominated by *statistical* redundancy. Each symbol is fairly predictable from its immediate context, but long exact repeats are relatively rare. A BWT followed by a good adaptive model captures every context of every length at once. xz's LZ77 core can only exploit exact repeats; its literal and context coding (LZMA) is good, but not as good as a dedicated model on sorted contexts.
+**Where BWTSorter wins** (text, dictionaries, databases, images; 8 files, 10–25% smaller than xz): this data is dominated by *statistical* redundancy. Each symbol is fairly predictable from its immediate context, but long exact repeats are relatively rare. A BWT followed by a good adaptive model captures every context of every length at once. xz's LZ77 core can only exploit exact repeats; its literal and context coding (LZMA) is good, but not as good as a dedicated model on sorted contexts.
 
-**Where xz wins** (4 files):
+**Where the LZ family wins** (4 files; xz and 7-Zip's LZMA2 take all four):
 
 - **mozilla, ooffice** (executables, +5% to +20%). In machine code, the same call instruction to the same function encodes a *different* relative offset at each call site. That breaks up the contexts the BWT relies on. LZ matching with "repeat last offset" codes handles the structured, operand-heavy layout of code better. mozilla is also a tar of many dissimilar files, which favours LZ's ability to adapt instantly at file boundaries.
 - **samba** (source code tarball, +5.5%). Source trees contain many long exact duplicates (licence headers, repeated boilerplate, near-identical files) that LZ77 encodes as single cheap matches. BWT handles them well too, but pays a small cost at every point where a duplicated region's sorted contexts start and end.
-- **sao** (binary star catalogue, +5.4%). This consists of fixed-width records of floating-point numbers. The most useful context is often "the same field in the previous record" rather than the preceding bytes. LZ matching with repeated offsets can pick up some of that regularity; a BWT, which sorts by the bytes that immediately follow, largely loses it.
+- **sao** (binary star catalogue, +5.4% against xz). This consists of fixed-width records of floating-point numbers. The most useful context is often "the same field in the previous record" rather than the preceding bytes. LZ matching with repeated offsets can pick up some of that regularity; a BWT, which sorts by the bytes that immediately follow, largely loses it.
+
+**Against bsc and PPMd.** All three are statistical compressors, so they win and lose on the same kinds of data, and the differences between them are a few percent. BWTSorter's run models and bit-level mixing do best where symbol statistics are noisy, as in images and binary records. bsc's preprocessing and rank-based coding do slightly better on large, clean text. PPMd works on the original byte order rather than sorted contexts, which helps on nested markup like XML but costs it elsewhere.
 
 ---
 
@@ -376,7 +413,7 @@ The consistent lesson was **forget fast**. Almost every gain came from making th
 |---|---|---|
 | 1 (original) | Comparison-sort BWT, 100 KB blocks, MTF, byte-pair RLE | Did not round-trip (inverse BWT reversed each block); quadratic sort on repetitive data |
 | 2 | Prefix-doubling BWT, 900 KB blocks, MTF, RUNA/RUNB, single Huffman table | About 15% larger than bzip2 on large text |
-| 3 (current) | SA-IS BWT, 32 MB blocks, context mixing, arithmetic coding | 3.8% smaller than xz -9e and 14.5% smaller than bzip2 -9 on the whole corpus |
+| 3 (current) | SA-IS BWT, 32 MB blocks, context mixing, arithmetic coding | Smallest total of 12 compressor configurations tested, including bsc, PPMd, xz, brotli and zstd (§10) |
 
 Each version's format is incompatible with the others, and the decoder rejects older files with a clear message.
 

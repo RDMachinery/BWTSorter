@@ -82,24 +82,48 @@ java BWTSorter -d myfile.bwts myfile-restored.txt
 
 ## How well does it work?
 
-These results come from the **Silesia corpus**, a standard collection of files that compression programs are tested on. The comparison is with `bzip2` and `xz`, the two compressors most commonly built into Mac and Linux systems, each at its strongest setting. Smaller is better:
+To find out, BWTSorter was tested against the most popular compression programs on the **Silesia corpus**, a standard collection of 12 test files (212 MB in total) that compression programs are measured with. Every program was set to squeeze as hard as it can.
 
-| Type of file | Original | BWTSorter | bzip2 | xz |
-|---|---|---|---|---|
-| Novels by Charles Dickens | 10.2 MB | **2.25 MB** | 2.80 MB | 2.83 MB |
-| An English dictionary | 41.5 MB | **6.64 MB** | 8.64 MB | 8.37 MB |
-| A database | 10.1 MB | **2.19 MB** | 2.80 MB | 2.84 MB |
-| Medical scan (MRI) | 10.0 MB | **2.11 MB** | 2.44 MB | 2.75 MB |
-| XML documents | 5.3 MB | **0.39 MB** | 0.44 MB | 0.43 MB |
-| Program source code | 21.6 MB | 3.94 MB | 4.55 MB | **3.74 MB** |
-| Program files (Firefox) | 51.2 MB | 16.0 MB | 17.9 MB | **13.4 MB** |
-| **All 12 test files together** | **211.9 MB** | **46.6 MB** | 54.5 MB | 48.5 MB |
+### Overall: everything squeezed together
 
-BWTSorter came out smallest on 8 of the 12 files, and smallest overall. It's especially good with text, data and images. It's less good with program files (apps and libraries), where `xz` does better.
+| Program | Where you might have met it | All 12 files compressed to |
+|---|---|---|
+| **BWTSorter** | this program | **46.6 MB** 🏆 |
+| bsc | specialist tool, the strongest of BWTSorter's relatives | 46.8 MB |
+| 7-Zip (PPMd mode) | the 7-Zip app, "PPMd" option | 47.7 MB |
+| xz | `.tar.xz` downloads on Mac and Linux | 48.5 MB |
+| 7-Zip (normal mode) | `.7z` files | 48.8 MB |
+| brotli | how many websites send pages to your browser | 49.6 MB |
+| zstd | Facebook's compressor, used inside many apps and systems | 52.4 MB |
+| bzip2 | `.bz2` / `.tar.bz2` files | 54.5 MB |
+| gzip / zip | `.gz` and ordinary `.zip` files | 67.6 MB |
+| lz4 | games and databases, where speed matters most | 77.4 MB |
 
-Photos, music, videos and `.zip` files will come out about the same size, which is normal. These are *already* compressed, so there's nothing left to squeeze. Photos, music, videos and zip files are *already* compressed, so there's nothing left to squeeze. BWTSorter notices this and simply stores those parts as they are, so the file never gets meaningfully bigger.
+**BWTSorter came first**, a whisker ahead of bsc and comfortably ahead of everything most people use day to day. The same files take up about **30% less space** than as ordinary `.zip` files.
 
-**Speed:** BWTSorter handles about 1.4 MB per second, both when compressing and when restoring. A 10 MB document takes about 7 seconds each way, and the whole 212 MB test collection took about 2½ minutes each way. That's a little quicker than `xz` at compressing, but much slower at restoring. The extra squeeze comes from doing careful work in both directions.
+### File by file
+
+| Type of file | Original | BWTSorter | 7-Zip | xz | zip |
+|---|---|---|---|---|---|
+| Novels by Charles Dickens | 10.2 MB | **2.25 MB** | 2.83 MB | 2.83 MB | 3.85 MB |
+| An English dictionary | 41.5 MB | **6.64 MB** | 8.39 MB | 8.37 MB | 12.06 MB |
+| A database | 10.1 MB | **2.19 MB** | 2.85 MB | 2.84 MB | 3.72 MB |
+| Medical scan (MRI) | 10.0 MB | **2.11 MB** | 2.75 MB | 2.75 MB | 3.67 MB |
+| XML documents | 5.3 MB | **0.39 MB** | 0.46 MB | 0.43 MB | 0.66 MB |
+| Program source code | 21.6 MB | 3.94 MB | 3.76 MB | **3.74 MB** | 5.41 MB |
+| Program files (Firefox) | 51.2 MB | 16.0 MB | **13.3 MB** | 13.4 MB | 19.0 MB |
+
+(7-Zip is shown in its normal mode. The "zip" column is gzip, which uses the same method as `.zip` files.)
+
+BWTSorter is especially good with text, data and images. It's less good with program files (apps and libraries), where 7-Zip and xz do better.
+
+Photos, music, videos and `.zip` files will come out about the same size, which is normal. These are *already* compressed, so there's nothing left to squeeze.
+
+### The catch: speed
+
+BWTSorter handles about 1.4 MB per second, both when compressing and when restoring. A 10 MB document takes about 7 seconds each way, and the whole 212 MB test collection took about 2½ minutes each way.
+
+That's similar to other programs at their strongest settings when compressing (faster than xz and brotli, in fact), but much slower when restoring: programs like zip, xz and 7-Zip unpack files in a second or two. BWTSorter gets its extra squeeze by doing careful prediction work in both directions. That makes it best suited to archiving, where you compress something once and rarely need it back, rather than files you open every day.
 
 ---
 

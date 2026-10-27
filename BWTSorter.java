@@ -1,62 +1,56 @@
 import java.io.*;
 import java.nio.charset.StandardCharsets;
-import java.util.PriorityQueue;
+import java.util.Arrays;
 import java.util.zip.CRC32;
 
 /**
  * BWTSorter
  *
- * A block-sorting compressor in the style of bzip2, written as a single readable file.
- * It treats compression as a sorting problem: sorting all rotations of a block groups
- * together characters that appear in similar contexts, and that grouping is what the
- * later stages exploit.
+ * A block-sorting compressor written as a single readable file. It treats compression
+ * as a sorting problem: sorting all suffixes of a block groups together characters that
+ * appear in similar contexts, and a context-mixing model then predicts that grouped
+ * stream bit by bit for an arithmetic coder.
  *
- * COMPRESSION PIPELINE (per block of up to 900 KB):
- *  1. Burrows-Wheeler Transform. All cyclic rotations of the block are sorted using
- *     prefix doubling with radix sort: O(n log n) regardless of how repetitive the
- *     data is. The last column of the sorted rotation matrix is the BWT output, and
- *     the "primary index" records which row holds the original, unrotated block.
- *     Characters with similar following context end up next to each other, so the
- *     last column is dominated by a few locally frequent symbols.
- *  2. Move-To-Front. Locally frequent symbols become small numbers, mostly 0.
- *  3. Zero-run coding (bzip2's RUNA/RUNB). Each run of MTF zeros is written as its
- *     length in bijective base 2, so a run of length r costs about log2(r) symbols.
- *     Non-zero MTF values v become symbol v+1, and an end-of-block symbol is appended.
- *  4. Huffman coding. A canonical, length-limited Huffman code is built for the
- *     258-symbol alphabet. Small MTF values get short codes, which is where most of
- *     the compression actually comes from.
- *  5. If the coded block would not be smaller than the raw block (e.g. random or
+ * COMPRESSION PIPELINE (per block, 32 MB by default):
+ *  1. Burrows-Wheeler Transform. The suffix array of the block is built with SA-IS
+ *     (linear time), and the BWT is read off it. A virtual end-of-block sentinel makes
+ *     the rotations unambiguous; its row is stored as the "primary index". Large blocks
+ *     let the transform find repeats that are megabytes apart.
+ *  2. Context-mixing model. Each bit of the BWT output is predicted by several adaptive
+ *     models (order 0, order 1, order 2, and two run models keyed on the previous byte
+ *     and how long it has repeated). A gated linear mixer in the logistic domain
+ *     combines them, and two adaptive probability maps (APM/SSE) refine the result.
+ *  3. Binary arithmetic coding. Each bit is coded with the final probability, so a bit
+ *     that the model predicts with 99.9% confidence costs about 0.0014 bits.
+ *  4. If the coded block would not be smaller than the raw block (random or
  *     already-compressed data), the block is stored uncompressed instead.
  *
- * FILE FORMAT:
+ * FILE FORMAT (version 3):
  *   "BWTS" magic, 1 version byte, then a sequence of blocks:
  *     type byte: 0 = end of stream, 1 = BWT-coded, 2 = stored
  *     int  original length
  *     int  CRC32 of the original bytes
- *     BWT-coded: int primary index, int payload length, payload (Huffman bitstream)
+ *     BWT-coded: int primary index, int payload length, payload (arithmetic-coded)
  *     stored:    raw bytes
  *
- * DECOMPRESSION reverses the pipeline: Huffman decode, expand zero runs, inverse MTF,
- * then inverse BWT in O(n) by following the T-vector (psi mapping) forward from the
- * primary index. Each block's CRC32 is verified before it is written.
+ * DECOMPRESSION runs the same model in lock-step to decode the BWT output, then inverts
+ * the BWT in O(n) by following the T-vector (psi mapping) from the primary index. Each
+ * block's CRC32 is verified before it is written.
+ *
+ * CREDITS:
+ *   Mario Gianota - architect
+ *   Claude (an AI model by Anthropic) - implementation and documentation
  */
 public class BWTSorter {
 
-    private static final int BLOCK_SIZE = 900_000;
+    private static final int DEFAULT_BLOCK_MB = 32;
+    private static final int MAX_BLOCK_MB = 256;
     private static final byte[] MAGIC = "BWTS".getBytes(StandardCharsets.US_ASCII);
-    private static final int VERSION = 2;
+    private static final int VERSION = 3;
 
     private static final int BLOCK_END = 0;
     private static final int BLOCK_BWT = 1;
     private static final int BLOCK_STORED = 2;
-
-    // Symbol alphabet after zero-run coding.
-    private static final int RUNA = 0;
-    private static final int RUNB = 1;
-    private static final int EOB = 257;          // MTF values 1..255 map to 2..256
-    private static final int ALPHABET = 258;
-    private static final int MAX_CODE_LEN = 20;  // fits in the 5-bit length header
-    private static final int LEN_BITS = 5;
 
     public static void main(String[] args) {
         if (args.length < 3) {
@@ -70,66 +64,85 @@ public class BWTSorter {
 
         try {
             if ("-c".equalsIgnoreCase(mode)) {
+                int blockMB = DEFAULT_BLOCK_MB;
+                if (args.length >= 4) {
+                    try {
+                        blockMB = Integer.parseInt(args[3]);
+                    } catch (NumberFormatException e) {
+                        blockMB = -1;
+                    }
+                    if (blockMB < 1 || blockMB > MAX_BLOCK_MB) {
+                        System.err.println("Block size must be a whole number of megabytes from 1 to " + MAX_BLOCK_MB);
+                        System.exit(2);
+                    }
+                }
                 System.out.println("Compressing via BWT Block-Sorting...");
-                compress(inputFile, outputFile);
-                System.out.printf("Compression Complete -> %s (%d -> %d bytes)%n",
-                        outputFile.getName(), inputFile.length(), outputFile.length());
+                long start = System.nanoTime();
+                compress(inputFile, outputFile, blockMB * 1_000_000);
+                System.out.printf("Compression Complete -> %s (%d -> %d bytes, %.2fs)%n",
+                        outputFile.getName(), inputFile.length(), outputFile.length(),
+                        (System.nanoTime() - start) / 1e9);
             } else if ("-d".equalsIgnoreCase(mode)) {
                 System.out.println("Decompressing via Inverted Sorting Mapping...");
+                long start = System.nanoTime();
                 decompress(inputFile, outputFile);
-                System.out.println("Decompression Complete -> " + outputFile.getName());
+                System.out.printf("Decompression Complete -> %s (%.2fs)%n",
+                        outputFile.getName(), (System.nanoTime() - start) / 1e9);
             } else {
                 printUsage();
             }
         } catch (IOException e) {
             System.err.println("Error processing file: " + e.getMessage());
             System.exit(1);
+        } catch (OutOfMemoryError e) {
+            System.err.println("Not enough memory for this block size. Try a smaller block size "
+                    + "(e.g. 8) or give Java more memory with: java -Xmx2g BWTSorter ...");
+            System.exit(1);
         }
     }
 
     private static void printUsage() {
         System.out.println("Usage:");
-        System.out.println("  Compress:   java BWTSorter -c <input_file> <output_file>");
+        System.out.println("  Compress:   java BWTSorter -c <input_file> <output_file> [block_MB]");
         System.out.println("  Decompress: java BWTSorter -d <compressed_file> <decompressed_file>");
+        System.out.println();
+        System.out.println("  block_MB is optional (1-" + MAX_BLOCK_MB + ", default " + DEFAULT_BLOCK_MB
+                + "). Larger blocks usually compress better but need more memory.");
     }
 
     // =========================================================================
     // COMPRESSION ENGINE
     // =========================================================================
 
-    public static void compress(File inFile, File outFile) throws IOException {
-        try (InputStream in = new BufferedInputStream(new FileInputStream(inFile));
-             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(outFile)))) {
+    public static void compress(File inFile, File outFile, int blockSize) throws IOException {
+        try (InputStream in = new BufferedInputStream(new FileInputStream(inFile), 1 << 16);
+             DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(outFile), 1 << 16))) {
 
             out.write(MAGIC);
             out.writeByte(VERSION);
 
-            byte[] buffer = new byte[BLOCK_SIZE];
+            // Don't allocate a 32 MB buffer for a 2 KB file.
+            int bufferSize = (int) Math.max(1, Math.min(blockSize, inFile.length()));
+            byte[] buffer = new byte[bufferSize];
             int bytesRead;
-
-            // readNBytes always fills the buffer unless the input has ended,
-            // so every block except the last is exactly BLOCK_SIZE.
-            while ((bytesRead = in.readNBytes(buffer, 0, BLOCK_SIZE)) > 0) {
-                compressBlock(buffer, bytesRead, out);
+            while ((bytesRead = in.readNBytes(buffer, 0, buffer.length)) > 0) {
+                compressBlock(Arrays.copyOf(buffer, bytesRead), out);
             }
             out.writeByte(BLOCK_END);
         }
     }
 
-    private static void compressBlock(byte[] buffer, int n, DataOutputStream out) throws IOException {
-        byte[] block = new byte[n];
-        System.arraycopy(buffer, 0, block, 0, n);
-
+    private static void compressBlock(byte[] block, DataOutputStream out) throws IOException {
+        int n = block.length;
         CRC32 crc = new CRC32();
         crc.update(block);
         int checksum = (int) crc.getValue();
 
         BWTResult bwt = transformBWT(block);
-        byte[] mtf = transformMTF(bwt.bwtBlock);
-        byte[] payload = entropyEncode(mtf);
+        byte[] payload = ArithmeticCoder.encode(bwt.bwtBlock);
 
         // 8 extra bytes (primary index + payload length) for a coded block.
-        if (payload.length + 8 < n) {
+        if ((long) payload.length + 8 < n) {
             out.writeByte(BLOCK_BWT);
             out.writeInt(n);
             out.writeInt(checksum);
@@ -156,196 +169,31 @@ public class BWTSorter {
         }
     }
 
+    /**
+     * BWT of src with a virtual sentinel '$' that sorts before every byte.
+     *
+     * The sorted rotations of src$ are the sorted suffixes of src$, so the suffix array
+     * gives the row order directly. Row 0 is the suffix "$", preceded by src[n-1]. The row
+     * for suffix 0 (the whole block) is preceded by '$' itself; that byte is left out of
+     * the output and its row is recorded as the primary index. Output is exactly n bytes.
+     */
     private static BWTResult transformBWT(byte[] src) {
         int n = src.length;
-        int[] rotations = sortRotations(src);
+        int[] text = new int[n];
+        for (int i = 0; i < n; i++) text[i] = src[i] & 0xFF;
+        int[] sa = SuffixArray.build(text, 255);
+        text = null;
 
         byte[] bwt = new byte[n];
+        bwt[0] = src[n - 1];
         int primaryIndex = -1;
+        int j = 1;
         for (int i = 0; i < n; i++) {
-            // Row holding the original, unrotated block
-            if (rotations[i] == 0) primaryIndex = i;
-            // Last character of this sorted rotation
-            bwt[i] = src[(rotations[i] + n - 1) % n];
+            int p = sa[i];
+            if (p == 0) primaryIndex = i + 1;
+            else bwt[j++] = src[p - 1];
         }
         return new BWTResult(bwt, primaryIndex);
-    }
-
-    /**
-     * Sorts all cyclic rotations of src by prefix doubling.
-     *
-     * After the pass for length k, rank[i] orders rotations by their first k bytes.
-     * The order by the first 2k bytes is the order of the pairs
-     * (rank[i], rank[(i + k) mod n]), which two stable counting sorts produce in O(n).
-     * At most log2(n) passes are needed, so the whole sort is O(n log n) even for
-     * highly repetitive input, where character-by-character comparison degrades badly.
-     *
-     * For periodic input some rotations are genuinely identical. They keep tied ranks;
-     * any order among them yields the same BWT and decodes to the same block.
-     */
-    private static int[] sortRotations(byte[] src) {
-        int n = src.length;
-        int[] sa = new int[n];
-        int[] rank = new int[n];
-        int[] tmp = new int[n];
-        int[] cnt = new int[Math.max(256, n)];
-
-        // Pass 0: counting sort by the first byte.
-        for (int i = 0; i < n; i++) cnt[src[i] & 0xFF]++;
-        for (int i = 1; i < 256; i++) cnt[i] += cnt[i - 1];
-        for (int i = n - 1; i >= 0; i--) sa[--cnt[src[i] & 0xFF]] = i;
-
-        int classes = 1;
-        rank[sa[0]] = 0;
-        for (int i = 1; i < n; i++) {
-            if (src[sa[i]] != src[sa[i - 1]]) classes++;
-            rank[sa[i]] = classes - 1;
-        }
-
-        for (int k = 1; k < n && classes < n; k <<= 1) {
-            // sa is sorted by the first k bytes, so shifting each start back by k
-            // gives an order sorted by the second half of the 2k-byte prefix.
-            for (int i = 0; i < n; i++) {
-                int p = sa[i] - k;
-                tmp[i] = p < 0 ? p + n : p;
-            }
-
-            // Stable counting sort by the first half's rank.
-            java.util.Arrays.fill(cnt, 0, classes, 0);
-            for (int i = 0; i < n; i++) cnt[rank[tmp[i]]]++;
-            for (int i = 1; i < classes; i++) cnt[i] += cnt[i - 1];
-            for (int i = n - 1; i >= 0; i--) sa[--cnt[rank[tmp[i]]]] = tmp[i];
-
-            // Re-rank by the (first, second) pair.
-            tmp[sa[0]] = 0;
-            classes = 1;
-            for (int i = 1; i < n; i++) {
-                int a = sa[i], b = sa[i - 1];
-                int a2 = a + k; if (a2 >= n) a2 -= n;
-                int b2 = b + k; if (b2 >= n) b2 -= n;
-                if (rank[a] != rank[b] || rank[a2] != rank[b2]) classes++;
-                tmp[a] = classes - 1;
-            }
-            int[] swap = rank; rank = tmp; tmp = swap;
-        }
-        return sa;
-    }
-
-    // --- Move-To-Front Transform ---
-
-    private static byte[] transformMTF(byte[] input) {
-        byte[] list = new byte[256];
-        for (int i = 0; i < 256; i++) list[i] = (byte) i;
-
-        byte[] output = new byte[input.length];
-        for (int i = 0; i < input.length; i++) {
-            byte b = input[i];
-            int idx = 0;
-            while (list[idx] != b) idx++;
-            output[i] = (byte) idx;
-            System.arraycopy(list, 0, list, 1, idx);
-            list[0] = b;
-        }
-        return output;
-    }
-
-    // --- Zero-run coding + Huffman ---
-
-    /** Converts MTF output to the RUNA/RUNB symbol stream and Huffman-codes it. */
-    private static byte[] entropyEncode(byte[] mtf) {
-        int[] symbols = new int[mtf.length + 1];
-        int count = 0;
-        int i = 0;
-        while (i < mtf.length) {
-            int v = mtf[i] & 0xFF;
-            if (v == 0) {
-                int run = 0;
-                while (i < mtf.length && mtf[i] == 0) { run++; i++; }
-                // Bijective base-2: digit 1 -> RUNA, digit 2 -> RUNB, least significant first.
-                while (run > 0) {
-                    if ((run & 1) == 1) { symbols[count++] = RUNA; run = (run - 1) >> 1; }
-                    else                { symbols[count++] = RUNB; run = (run - 2) >> 1; }
-                }
-            } else {
-                symbols[count++] = v + 1;
-                i++;
-            }
-        }
-        symbols[count++] = EOB;
-
-        int[] freq = new int[ALPHABET];
-        for (int s = 0; s < count; s++) freq[symbols[s]]++;
-        int[] lengths = huffmanLengths(freq, MAX_CODE_LEN);
-        int[] codes = canonicalCodes(lengths);
-
-        BitWriter bw = new BitWriter(mtf.length / 2 + 64);
-        for (int s = 0; s < ALPHABET; s++) bw.write(lengths[s], LEN_BITS);
-        for (int s = 0; s < count; s++) bw.write(codes[symbols[s]], lengths[symbols[s]]);
-        return bw.toByteArray();
-    }
-
-    /**
-     * Huffman code lengths, limited to maxLen. If the optimal tree is too deep the
-     * frequencies are flattened (as bzip2 does) and the tree rebuilt.
-     */
-    private static int[] huffmanLengths(int[] freq, int maxLen) {
-        int[] f = freq.clone();
-        while (true) {
-            int[] lengths = buildTreeLengths(f);
-            int max = 0;
-            for (int l : lengths) max = Math.max(max, l);
-            if (max <= maxLen) return lengths;
-            for (int i = 0; i < f.length; i++) if (f[i] > 0) f[i] = 1 + (f[i] >> 1);
-        }
-    }
-
-    private static int[] buildTreeLengths(int[] freq) {
-        int n = freq.length;
-        int[] lengths = new int[n];
-        int[] parent = new int[2 * n];
-        long[] weight = new long[2 * n];
-        PriorityQueue<Integer> pq = new PriorityQueue<>((a, b) ->
-                weight[a] != weight[b] ? Long.compare(weight[a], weight[b]) : Integer.compare(a, b));
-
-        int used = 0, lastUsed = -1;
-        for (int i = 0; i < n; i++) {
-            if (freq[i] > 0) { weight[i] = freq[i]; pq.add(i); used++; lastUsed = i; }
-        }
-        if (used == 1) { lengths[lastUsed] = 1; return lengths; }
-
-        int next = n;
-        while (pq.size() > 1) {
-            int a = pq.poll(), b = pq.poll();
-            weight[next] = weight[a] + weight[b];
-            parent[a] = next;
-            parent[b] = next;
-            pq.add(next++);
-        }
-        int root = next - 1;
-        for (int i = 0; i < n; i++) {
-            if (freq[i] == 0) continue;
-            int depth = 0;
-            for (int node = i; node != root; node = parent[node]) depth++;
-            lengths[i] = depth;
-        }
-        return lengths;
-    }
-
-    /** Assigns canonical codes: shorter codes first, ties broken by symbol order. */
-    private static int[] canonicalCodes(int[] lengths) {
-        int[] blCount = new int[MAX_CODE_LEN + 1];
-        for (int l : lengths) if (l > 0) blCount[l]++;
-        int[] nextCode = new int[MAX_CODE_LEN + 1];
-        int code = 0;
-        for (int len = 1; len <= MAX_CODE_LEN; len++) {
-            nextCode[len] = code;
-            code = (code + blCount[len]) << 1;
-        }
-        int[] codes = new int[lengths.length];
-        for (int s = 0; s < lengths.length; s++) {
-            if (lengths[s] > 0) codes[s] = nextCode[lengths[s]]++;
-        }
-        return codes;
     }
 
     // =========================================================================
@@ -353,8 +201,8 @@ public class BWTSorter {
     // =========================================================================
 
     public static void decompress(File inFile, File outFile) throws IOException {
-        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(inFile)));
-             OutputStream out = new BufferedOutputStream(new FileOutputStream(outFile))) {
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(inFile), 1 << 16));
+             OutputStream out = new BufferedOutputStream(new FileOutputStream(outFile), 1 << 16)) {
 
             byte[] magic = new byte[MAGIC.length];
             try {
@@ -362,10 +210,14 @@ public class BWTSorter {
             } catch (EOFException e) {
                 throw new IOException("not a BWTSorter file (too short)");
             }
-            if (!java.util.Arrays.equals(magic, MAGIC)) throw new IOException("not a BWTSorter file (bad magic)");
+            if (!Arrays.equals(magic, MAGIC)) throw new IOException("not a BWTSorter file (bad magic)");
             int version = in.readUnsignedByte();
-            if (version != VERSION) throw new IOException("unsupported format version " + version);
+            if (version != VERSION) {
+                throw new IOException("unsupported format version " + version
+                        + (version < VERSION ? " (made by an older BWTSorter)" : ""));
+            }
 
+            int maxBlock = MAX_BLOCK_MB * 1_000_000;
             try {
                 int blockNo = 0;
                 while (true) {
@@ -374,7 +226,7 @@ public class BWTSorter {
 
                     int length = in.readInt();
                     int checksum = in.readInt();
-                    if (length <= 0 || length > BLOCK_SIZE) throw new IOException("corrupt block header (length " + length + ")");
+                    if (length <= 0 || length > maxBlock) throw new IOException("corrupt block header (length " + length + ")");
 
                     byte[] original;
                     if (type == BLOCK_STORED) {
@@ -383,14 +235,13 @@ public class BWTSorter {
                     } else if (type == BLOCK_BWT) {
                         int primaryIndex = in.readInt();
                         int payloadLen = in.readInt();
-                        if (primaryIndex < 0 || primaryIndex >= length || payloadLen <= 0 || payloadLen > 2 * BLOCK_SIZE) {
+                        if (primaryIndex < 1 || primaryIndex > length || payloadLen <= 0 || payloadLen >= length) {
                             throw new IOException("corrupt block header");
                         }
                         byte[] payload = new byte[payloadLen];
                         in.readFully(payload);
 
-                        byte[] mtf = entropyDecode(payload, length);
-                        byte[] bwt = inverseMTF(mtf);
+                        byte[] bwt = ArithmeticCoder.decode(payload, length);
                         original = inverseBWT(bwt, primaryIndex);
                     } else {
                         throw new IOException("unknown block type " + type);
@@ -410,164 +261,448 @@ public class BWTSorter {
         }
     }
 
-    // --- Huffman decode + zero-run expansion ---
-
-    private static byte[] entropyDecode(byte[] payload, int targetLength) throws IOException {
-        BitReader br = new BitReader(payload);
-        int[] lengths = new int[ALPHABET];
-        int[] blCount = new int[MAX_CODE_LEN + 1];
-        for (int s = 0; s < ALPHABET; s++) {
-            lengths[s] = br.read(LEN_BITS);
-            if (lengths[s] > MAX_CODE_LEN) throw new IOException("corrupt Huffman table");
-            if (lengths[s] > 0) blCount[lengths[s]]++;
-        }
-        // Symbols sorted by (length, symbol): the order canonical codes are assigned in.
-        int[] sorted = new int[ALPHABET];
-        int[] offset = new int[MAX_CODE_LEN + 2];
-        for (int len = 1; len <= MAX_CODE_LEN; len++) offset[len + 1] = offset[len] + blCount[len];
-        for (int s = 0; s < ALPHABET; s++) if (lengths[s] > 0) sorted[offset[lengths[s]]++] = s;
-
-        byte[] mtf = new byte[targetLength];
-        int pos = 0;
-        int run = 0, weight = 1;
-
-        while (true) {
-            int sym = decodeSymbol(br, blCount, sorted);
-            if (sym == RUNA || sym == RUNB) {
-                run += (sym == RUNA ? 1 : 2) * weight;
-                weight <<= 1;
-                if (run > targetLength) throw new IOException("corrupt run length");
-                continue;
-            }
-            // Any other symbol ends a pending zero run.
-            if (run > 0) {
-                if (pos + run > targetLength) throw new IOException("block overflows declared length");
-                pos += run;            // array is already zero-filled
-                run = 0;
-                weight = 1;
-            }
-            if (sym == EOB) break;
-            if (pos >= targetLength) throw new IOException("block overflows declared length");
-            mtf[pos++] = (byte) (sym - 1);
-        }
-        if (pos != targetLength) throw new IOException("block shorter than declared length");
-        return mtf;
-    }
-
-    /** Canonical Huffman decode, one bit at a time (the zlib "puff" method). */
-    private static int decodeSymbol(BitReader br, int[] blCount, int[] sorted) throws IOException {
-        int code = 0, first = 0, index = 0;
-        for (int len = 1; len <= MAX_CODE_LEN; len++) {
-            code |= br.read(1);
-            int count = blCount[len];
-            if (code - first < count) return sorted[index + code - first];
-            index += count;
-            first = (first + count) << 1;
-            code <<= 1;
-        }
-        throw new IOException("invalid Huffman code");
-    }
-
-    // --- Inverse MTF ---
-
-    private static byte[] inverseMTF(byte[] input) {
-        byte[] list = new byte[256];
-        for (int i = 0; i < 256; i++) list[i] = (byte) i;
-
-        byte[] output = new byte[input.length];
-        for (int i = 0; i < input.length; i++) {
-            int idx = input[i] & 0xFF;
-            byte b = list[idx];
-            output[i] = b;
-            System.arraycopy(list, 0, list, 1, idx);
-            list[0] = b;
-        }
-        return output;
-    }
-
-    // --- Inverse BWT ---
-
     /**
-     * Rebuilds the block in O(n).
+     * Rebuilds the block in O(n) from the BWT (sentinel removed) and the sentinel's row.
      *
-     * next[j] is the row whose last-column byte is the same occurrence as the
-     * first-column byte of row j (the T-vector, or psi mapping). Row primaryIndex
-     * is rotation 0; following next from it visits rotations 1, 2, 3, ... and the
-     * last-column byte of rotation r+1 is s[r], so the block comes out front to back.
+     * Conceptually the last column has n + 1 entries: the stored bytes with '$' inserted
+     * at row primaryIndex. next[j] is the row whose last-column byte is the same occurrence
+     * as the first-column byte of row j (the T-vector, or psi mapping). Row primaryIndex
+     * holds the whole block, so following next from it visits rotations 1, 2, 3, ... and
+     * yields the block front to back.
      */
     private static byte[] inverseBWT(byte[] bwt, int primaryIndex) {
         int n = bwt.length;
-        int[] count = new int[257];
-        int[] next = new int[n];
+        int[] start = new int[256];
+        for (byte b : bwt) start[b & 0xFF]++;
+        int sum = 1;                         // first-column row 0 belongs to '$'
+        for (int c = 0; c < 256; c++) {
+            int count = start[c];
+            start[c] = sum;
+            sum += count;
+        }
 
-        for (int i = 0; i < n; i++) count[(bwt[i] & 0xFF) + 1]++;
-        for (int i = 0; i < 256; i++) count[i + 1] += count[i];
-        for (int i = 0; i < n; i++) {
-            int symbol = bwt[i] & 0xFF;
-            next[count[symbol]++] = i;
+        int[] next = new int[n + 1];
+        next[0] = primaryIndex;
+        for (int row = 0, i = 0; row <= n; row++) {
+            if (row == primaryIndex) continue;
+            next[start[bwt[i++] & 0xFF]++] = row;
         }
 
         byte[] original = new byte[n];
         int curr = primaryIndex;
-        for (int i = 0; i < n; i++) {
+        for (int k = 0; k < n; k++) {
             curr = next[curr];
-            original[i] = bwt[curr];
+            original[k] = bwt[curr < primaryIndex ? curr : curr - 1];
         }
         return original;
     }
 
     // =========================================================================
-    // BIT I/O (most significant bit first)
+    // SUFFIX ARRAY CONSTRUCTION (SA-IS)
     // =========================================================================
 
-    private static class BitWriter {
-        private byte[] buf;
-        private int pos;
-        private long acc;
-        private int bits;
+    /**
+     * SA-IS: suffix array construction in O(n) time (Nong, Zhang and Chan, 2009).
+     *
+     * Suffixes are classified as S-type (smaller than the next suffix) or L-type (larger).
+     * The leftmost S-type positions (LMS) split the text into substrings. Placing the LMS
+     * suffixes at the ends of their buckets and "inducing" L-types left to right and then
+     * S-types right to left sorts the LMS substrings. If they aren't all distinct, the
+     * problem is reduced to a string of their ranks (at most half as long) and solved
+     * recursively; a final induce from the correctly ordered LMS suffixes sorts everything.
+     *
+     * Structure follows the AtCoder Library implementation.
+     */
+    static final class SuffixArray {
 
-        BitWriter(int capacity) { buf = new byte[Math.max(16, capacity)]; }
+        static int[] build(int[] s, int upper) {
+            int n = s.length;
+            if (n == 0) return new int[0];
+            if (n == 1) return new int[]{0};
+            if (n == 2) return s[0] < s[1] ? new int[]{0, 1} : new int[]{1, 0};
 
-        void write(int value, int n) {
-            acc = (acc << n) | (value & ((1L << n) - 1));
-            bits += n;
-            while (bits >= 8) {
-                bits -= 8;
-                put((byte) (acc >>> bits));
+            int[] sa = new int[n];
+            boolean[] ls = new boolean[n];     // true = S-type
+            for (int i = n - 2; i >= 0; i--) {
+                ls[i] = (s[i] == s[i + 1]) ? ls[i + 1] : (s[i] < s[i + 1]);
             }
+
+            int[] sumL = new int[upper + 1];
+            int[] sumS = new int[upper + 1];
+            for (int i = 0; i < n; i++) {
+                if (!ls[i]) sumS[s[i]]++;
+                else sumL[s[i] + 1]++;
+            }
+            for (int i = 0; i <= upper; i++) {
+                sumS[i] += sumL[i];
+                if (i < upper) sumL[i + 1] += sumS[i];
+            }
+
+            int[] lmsMap = new int[n + 1];
+            Arrays.fill(lmsMap, -1);
+            int m = 0;
+            for (int i = 1; i < n; i++) {
+                if (!ls[i - 1] && ls[i]) lmsMap[i] = m++;
+            }
+            int[] lms = new int[m];
+            for (int i = 1, k = 0; i < n; i++) {
+                if (!ls[i - 1] && ls[i]) lms[k++] = i;
+            }
+
+            int[] buf = new int[upper + 1];
+            induce(s, sa, ls, sumL, sumS, buf, lms, m);
+
+            if (m > 0) {
+                int[] sortedLms = new int[m];
+                for (int i = 0, k = 0; i < n; i++) {
+                    int v = sa[i];
+                    if (lmsMap[v] != -1) sortedLms[k++] = v;
+                }
+
+                int[] recS = new int[m];
+                int recUpper = 0;
+                recS[lmsMap[sortedLms[0]]] = 0;
+                for (int i = 1; i < m; i++) {
+                    int l = sortedLms[i - 1], r = sortedLms[i];
+                    int endL = (lmsMap[l] + 1 < m) ? lms[lmsMap[l] + 1] : n;
+                    int endR = (lmsMap[r] + 1 < m) ? lms[lmsMap[r] + 1] : n;
+                    boolean same = true;
+                    if (endL - l != endR - r) {
+                        same = false;
+                    } else {
+                        while (l < endL) {
+                            if (s[l] != s[r]) break;
+                            l++;
+                            r++;
+                        }
+                        if (l == n || s[l] != s[r]) same = false;
+                    }
+                    if (!same) recUpper++;
+                    recS[lmsMap[sortedLms[i]]] = recUpper;
+                }
+                lmsMap = null;
+
+                int[] recSa = build(recS, recUpper);
+                for (int i = 0; i < m; i++) sortedLms[i] = lms[recSa[i]];
+                induce(s, sa, ls, sumL, sumS, buf, sortedLms, m);
+            }
+            return sa;
         }
 
-        private void put(byte b) {
-            if (pos == buf.length) buf = java.util.Arrays.copyOf(buf, buf.length * 2);
-            buf[pos++] = b;
-        }
-
-        byte[] toByteArray() {
-            if (bits > 0) { put((byte) (acc << (8 - bits))); bits = 0; }
-            return java.util.Arrays.copyOf(buf, pos);
+        private static void induce(int[] s, int[] sa, boolean[] ls, int[] sumL, int[] sumS,
+                                   int[] buf, int[] lms, int m) {
+            int n = s.length;
+            Arrays.fill(sa, -1);
+            System.arraycopy(sumS, 0, buf, 0, buf.length);
+            for (int i = 0; i < m; i++) {
+                int d = lms[i];
+                if (d == n) continue;
+                sa[buf[s[d]]++] = d;
+            }
+            System.arraycopy(sumL, 0, buf, 0, buf.length);
+            sa[buf[s[n - 1]]++] = n - 1;
+            for (int i = 0; i < n; i++) {
+                int v = sa[i];
+                if (v >= 1 && !ls[v - 1]) sa[buf[s[v - 1]]++] = v - 1;
+            }
+            System.arraycopy(sumL, 0, buf, 0, buf.length);
+            for (int i = n - 1; i >= 0; i--) {
+                int v = sa[i];
+                // An S-type suffix is smaller than some later character, so it never
+                // starts with the largest symbol and s[v - 1] + 1 stays in range.
+                if (v >= 1 && ls[v - 1]) sa[--buf[s[v - 1] + 1]] = v - 1;
+            }
         }
     }
 
-    private static class BitReader {
-        private final byte[] data;
-        private int pos;
-        private int acc;
-        private int bits;
+    // =========================================================================
+    // CONTEXT-MIXING MODEL
+    // =========================================================================
 
-        BitReader(byte[] data) { this.data = data; }
+    /** Shared logistic-domain helpers (integer, so encoder and decoder agree exactly). */
+    static final class Logistic {
+        static final int[] STRETCH = new int[4096];
+        private static final int[] SQUASH_POINTS = {
+                1, 2, 3, 6, 10, 16, 27, 45, 73, 120, 194, 310, 488, 747, 1101, 1546,
+                2047, 2549, 2994, 3348, 3607, 3785, 3901, 3975, 4022, 4050, 4068, 4079,
+                4085, 4089, 4092, 4093, 4094};
 
-        int read(int n) throws IOException {
-            int result = 0;
-            for (int i = 0; i < n; i++) {
-                if (bits == 0) {
-                    if (pos >= data.length) throw new IOException("Huffman stream ended early");
-                    acc = data[pos++] & 0xFF;
-                    bits = 8;
-                }
-                bits--;
-                result = (result << 1) | ((acc >>> bits) & 1);
+        static {
+            int pi = 0;
+            for (int x = -2047; x <= 2047; x++) {
+                int v = squash(x);
+                for (int i = pi; i <= v; i++) STRETCH[i] = x;
+                pi = v + 1;
             }
-            return result;
+            for (int i = pi; i < 4096; i++) STRETCH[i] = 2047;
+        }
+
+        /** 4096 / (1 + e^(-d/256)), interpolated from 33 points; d in [-2047, 2047]. */
+        static int squash(int d) {
+            if (d > 2047) return 4095;
+            if (d < -2047) return 1;
+            int w = d & 127;
+            int i = (d >> 7) + 16;
+            return (SQUASH_POINTS[i] * (128 - w) + SQUASH_POINTS[i + 1] * w + 64) >> 7;
+        }
+
+        static int stretch(int p) {
+            return STRETCH[p];
+        }
+    }
+
+    /**
+     * Adaptive probability for each context, stored as a 22-bit probability and a 10-bit
+     * hit count in one int. The update step is 1/(count + 1.5) until the count reaches
+     * the limit, so new contexts learn fast and settled ones become stable but can still
+     * drift as the data changes.
+     */
+    static final class StateMap {
+        private static final int[] DT = new int[1024];
+        static {
+            for (int i = 0; i < 1024; i++) DT[i] = 16384 / (i + i + 3);
+        }
+
+        final int[] t;
+        private final int limit;
+
+        StateMap(int size, int limit) {
+            t = new int[size];
+            Arrays.fill(t, 1 << 31);
+            this.limit = limit;
+        }
+
+        /** 12-bit probability that the next bit is 1. */
+        int p(int cx) {
+            return t[cx] >>> 20;
+        }
+
+        void update(int cx, int y) {
+            int v = t[cx];
+            int n = v & 1023;
+            int p = v >>> 10;
+            if (n < limit) v++;
+            else v = (v & 0xfffffc00) | limit;
+            v += ((((y << 22) - p) >> 3) * DT[n]) & 0xfffffc00;
+            t[cx] = v;
+        }
+    }
+
+    /**
+     * Adaptive probability map (secondary estimation): refines an input probability in a
+     * given context by interpolating between 33 learned points along the stretch axis.
+     */
+    static final class APM {
+        private final int[] t;
+        private final int rate;
+        private int index;
+
+        APM(int contexts, int rate) {
+            t = new int[contexts * 33];
+            this.rate = rate;
+            for (int i = 0; i < contexts; i++) {
+                for (int j = 0; j < 33; j++) {
+                    t[i * 33 + j] = Logistic.squash((j - 16) * 128) * 16;
+                }
+            }
+        }
+
+        int p(int pr, int cx) {
+            int s = Logistic.stretch(pr) + 2048;
+            int lo = s >> 7, w = s & 127;
+            int base = cx * 33 + lo;
+            index = base + (w >> 6);
+            return (t[base] * (128 - w) + t[base + 1] * w) >> 11;
+        }
+
+        void update(int y) {
+            int g = (y << 16) + (y << rate) - y - y;
+            t[index] += (g - t[index]) >> rate;
+        }
+    }
+
+    /**
+     * Predicts the BWT output one bit at a time (most significant bit first).
+     *
+     * Inputs to the mixer, each a stretched probability:
+     *   order 0   - the bits of the current byte seen so far
+     *   order 1   - plus the previous byte
+     *   order 2   - plus the two previous bytes
+     *   run       - previous byte and how many times it has repeated (BWT output is
+     *               dominated by runs, and run length strongly predicts continuation)
+     *   run match - "will this byte repeat the previous one?": the bit the previous byte
+     *               predicts, while the partial byte still agrees with it, by run length
+     *   bias      - a constant input the mixer can weight freely
+     * Weights are selected by run length and the partial byte, then two APM stages refine
+     * the mixed probability using order-1 and run contexts.
+     *
+     * The adaptation limits were tuned on the Silesia corpus. BWT output changes character
+     * every few hundred bytes as the sort moves from one context to the next, so the
+     * order-n maps forget quickly (limits of 8-15), while the run maps, whose statistics
+     * hold across the whole block, are allowed to settle.
+     */
+    static final class Predictor {
+        private static final int INPUTS = 6;
+
+        private final StateMap o0 = new StateMap(256, 15);
+        private final StateMap o1 = new StateMap(1 << 16, 12);
+        private final StateMap o2 = new StateMap(1 << 24, 8);
+        private final StateMap runMap = new StateMap(256 * 16 * 256, 127);
+        private final StateMap runMatch = new StateMap(16 * 2 * 256, 255);
+        private final APM apm1 = new APM(1 << 16, 7);
+        private final APM apm2 = new APM(16 * 256, 7);
+
+        private final int[] weights;
+        private final int[] st = new int[INPUTS];
+        private int weightBase;
+
+        private int c0 = 1, c1, c2, run;
+        private int runBucket;
+        private int cx1, cx2, cxRun, cxMatch;
+        private int pMix, pr = 2048;
+
+        Predictor() {
+            weights = new int[16 * 256 * INPUTS];
+            Arrays.fill(weights, (1 << 16) / 3);
+            setContexts();
+        }
+
+        /** 12-bit probability that the next bit is 1. */
+        int p() {
+            return pr;
+        }
+
+        void update(int y) {
+            // Train every component on the actual bit.
+            o0.update(c0, y);
+            o1.update(cx1, y);
+            o2.update(cx2, y);
+            runMap.update(cxRun, y);
+            runMatch.update(cxMatch, y);
+
+            int err = ((y << 12) - pMix) * 16;
+            for (int i = 0; i < INPUTS; i++) {
+                weights[weightBase + i] += (st[i] * err) >> 16;
+            }
+            apm1.update(y);
+            apm2.update(y);
+
+            // Advance the bit/byte state.
+            c0 = (c0 << 1) | y;
+            if (c0 >= 256) {
+                int b = c0 & 255;
+                if (b == c1) run++;
+                else run = 0;
+                c2 = c1;
+                c1 = b;
+                c0 = 1;
+                runBucket = run < 8 ? run : run < 16 ? 8 + ((run - 8) >> 1) : run < 64 ? 12 + ((run - 16) >> 4) : 15;
+            }
+            setContexts();
+        }
+
+        private void setContexts() {
+            cx1 = (c1 << 8) | c0;
+            cx2 = (c2 << 16) | (c1 << 8) | c0;
+            cxRun = (((c1 << 4) | runBucket) << 8) | c0;
+
+            // Does the partial byte still agree with the previous byte's leading bits?
+            int bitsSoFar = 31 - Integer.numberOfLeadingZeros(c0);
+            boolean onTrack = (c0 ^ (0x100 | c1) >>> (8 - bitsSoFar)) == 0;
+            int expectedBit = onTrack ? (c1 >>> (7 - bitsSoFar)) & 1 : 0;
+            cxMatch = (((runBucket << 1) | expectedBit) << 8) | (onTrack ? c0 : 0);
+
+            st[0] = Logistic.stretch(o0.p(c0));
+            st[1] = Logistic.stretch(o1.p(cx1));
+            st[2] = Logistic.stretch(o2.p(cx2));
+            st[3] = Logistic.stretch(runMap.p(cxRun));
+            st[4] = Logistic.stretch(runMatch.p(cxMatch));
+            st[5] = 256;
+
+            weightBase = ((runBucket << 8) | c0) * INPUTS;
+            long dot = 0;
+            for (int i = 0; i < INPUTS; i++) dot += (long) st[i] * weights[weightBase + i];
+            int mixed = (int) Math.max(-2047, Math.min(2047, dot >> 16));
+            pMix = Logistic.squash(mixed);
+
+            int a1 = apm1.p(pMix, cx1);
+            int a2 = apm2.p(pMix, (runBucket << 8) | c0);
+            int p = (pMix + a1 + a2 * 2 + 2) >> 2;
+            pr = Math.max(1, Math.min(4095, p));
+        }
+    }
+
+    // =========================================================================
+    // BINARY ARITHMETIC CODER
+    // =========================================================================
+
+    /**
+     * Carry-less binary arithmetic coder with a 32-bit range [x1, x2]. Each bit splits the
+     * range in proportion to its predicted probability; whenever the top byte of x1 and x2
+     * agrees it can never change again, so it is shifted out.
+     */
+    static final class ArithmeticCoder {
+
+        static byte[] encode(byte[] data) {
+            Predictor model = new Predictor();
+            ByteArrayOutputStream out = new ByteArrayOutputStream(Math.max(64, data.length / 3));
+            long x1 = 0, x2 = 0xFFFFFFFFL;
+
+            for (byte value : data) {
+                int c = value & 0xFF;
+                for (int bit = 7; bit >= 0; bit--) {
+                    int y = (c >>> bit) & 1;
+                    long xmid = x1 + ((x2 - x1) >>> 12) * model.p();
+                    if (y == 1) x2 = xmid;
+                    else x1 = xmid + 1;
+                    model.update(y);
+                    while (((x1 ^ x2) & 0xFF000000L) == 0) {
+                        out.write((int) (x2 >>> 24));
+                        x1 = (x1 << 8) & 0xFFFFFFFFL;
+                        x2 = ((x2 << 8) & 0xFFFFFFFFL) | 0xFF;
+                    }
+                }
+            }
+            // Flush enough of x1 to identify a point inside the final range.
+            for (int i = 0; i < 4; i++) {
+                out.write((int) (x1 >>> 24));
+                x1 = (x1 << 8) & 0xFFFFFFFFL;
+            }
+            return out.toByteArray();
+        }
+
+        static byte[] decode(byte[] payload, int length) {
+            Predictor model = new Predictor();
+            byte[] data = new byte[length];
+            long x1 = 0, x2 = 0xFFFFFFFFL, x = 0;
+            int pos = 0;
+            for (int i = 0; i < 4; i++) {
+                x = (x << 8) | (pos < payload.length ? payload[pos++] & 0xFF : 0);
+            }
+
+            for (int k = 0; k < length; k++) {
+                int c = 0;
+                for (int bit = 0; bit < 8; bit++) {
+                    long xmid = x1 + ((x2 - x1) >>> 12) * model.p();
+                    int y;
+                    if (x <= xmid) {
+                        y = 1;
+                        x2 = xmid;
+                    } else {
+                        y = 0;
+                        x1 = xmid + 1;
+                    }
+                    model.update(y);
+                    c = (c << 1) | y;
+                    while (((x1 ^ x2) & 0xFF000000L) == 0) {
+                        x1 = (x1 << 8) & 0xFFFFFFFFL;
+                        x2 = ((x2 << 8) & 0xFFFFFFFFL) | 0xFF;
+                        x = ((x << 8) & 0xFFFFFFFFL) | (pos < payload.length ? payload[pos++] & 0xFF : 0);
+                    }
+                }
+                data[k] = (byte) c;
+            }
+            return data;
         }
     }
 }

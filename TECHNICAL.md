@@ -1,8 +1,8 @@
 # BWTSorter — Technical Notes
 
-This document describes how BWTSorter works internally: the compression pipeline, the algorithms behind each stage, the on-disk format, and the design trade-offs. It is aimed at developers and the curious. For usage instructions, see [README.md](README.md).
+This document describes how BWTSorter works internally: the compression pipeline, the algorithms behind each stage, the on-disk format, the design trade-offs, and how it compares with bzip2 and xz. It is aimed at developers and the curious. For usage instructions, see [README.md](README.md).
 
-BWTSorter is a single-file Java program (`BWTSorter.java`, about 570 lines, no dependencies beyond the JDK). It implements a block-sorting compressor in the same family as `bzip2`.
+BWTSorter is a single-file Java program (`BWTSorter.java`, about 710 lines, no dependencies beyond the JDK). It is a block-sorting compressor, related to `bzip2` but with a modern back end: a linear-time suffix sort, large blocks, and a context-mixing model driving an arithmetic coder. This places it in the same family as `bsc` and `bcm`.
 
 ---
 
@@ -10,38 +10,40 @@ BWTSorter is a single-file Java program (`BWTSorter.java`, about 570 lines, no d
 
 1. [Pipeline overview](#1-pipeline-overview)
 2. [Stage 1: Burrows–Wheeler Transform](#2-stage-1-burrowswheeler-transform)
-3. [Stage 2: Move-To-Front](#3-stage-2-move-to-front)
-4. [Stage 3: Zero-run coding (RUNA/RUNB)](#4-stage-3-zero-run-coding-runarunb)
-5. [Stage 4: Canonical Huffman coding](#5-stage-4-canonical-huffman-coding)
-6. [Stored-block fallback](#6-stored-block-fallback)
-7. [Decompression and the inverse BWT](#7-decompression-and-the-inverse-bwt)
-8. [File format](#8-file-format)
-9. [Integrity and error handling](#9-integrity-and-error-handling)
-10. [Complexity and memory](#10-complexity-and-memory)
-11. [Benchmarks](#11-benchmarks)
-12. [Comparison with bzip2](#12-comparison-with-bzip2)
-13. [Limitations and possible extensions](#13-limitations-and-possible-extensions)
-14. [Code map](#14-code-map)
+3. [Stage 2: Context-mixing model](#3-stage-2-context-mixing-model)
+4. [Stage 3: Binary arithmetic coder](#4-stage-3-binary-arithmetic-coder)
+5. [Stored-block fallback](#5-stored-block-fallback)
+6. [Decompression and the inverse BWT](#6-decompression-and-the-inverse-bwt)
+7. [File format](#7-file-format)
+8. [Integrity and error handling](#8-integrity-and-error-handling)
+9. [Complexity and memory](#9-complexity-and-memory)
+10. [Benchmarks](#10-benchmarks)
+11. [Why it beats xz on some files and not others](#11-why-it-beats-xz-on-some-files-and-not-others)
+12. [How the model was tuned](#12-how-the-model-was-tuned)
+13. [Version history](#13-version-history)
+14. [Limitations and possible extensions](#14-limitations-and-possible-extensions)
+15. [Code map](#15-code-map)
 
 ---
 
 ## 1. Pipeline overview
 
-Input is split into blocks of up to **900,000 bytes**, and each block is compressed independently.
+Input is split into blocks, **32 MB by default** (configurable from 1 to 256 MB), and each block is compressed independently.
 
 ```
-           ┌──────────┐   ┌─────┐   ┌──────────────┐   ┌─────────┐
- block ──▶ │   BWT    │──▶│ MTF │──▶│ zero-run     │──▶│ Huffman │──▶ payload
- (bytes)   │ (sort)   │   │     │   │ RUNA / RUNB  │   │         │
-           └──────────┘   └─────┘   └──────────────┘   └─────────┘
-                │                                           │
-          primary index                         if payload ≥ block size
-                                                  → store block raw
+           ┌─────────────────┐   ┌──────────────────────┐   ┌────────────┐
+ block ──▶ │ BWT via SA-IS   │──▶│ context-mixing model │──▶│ arithmetic │──▶ payload
+ (bytes)   │ (suffix sort)   │   │ (predicts each bit)  │──▶│   coder    │
+           └─────────────────┘   └──────────────────────┘   └────────────┘
+                   │                        ▲  bit                │
+             primary index                  └─────────────────────┘
+                                                  if payload ≥ block size
+                                                    → store block raw
 ```
 
-None of the stages compresses much on its own. The BWT is a *permutation*: it makes the data no smaller, only more predictable. MTF turns that predictability into a skewed distribution of small numbers. Zero-run coding collapses the most common case, long stretches of zeros, and Huffman coding finally converts the skewed distribution into fewer bits.
+The BWT is a *permutation*: it makes the data no smaller, only far more predictable. The model then estimates, for every bit of the BWT output, the probability that it is a 1. The arithmetic coder spends almost exactly −log₂(p) bits on each bit it codes, so a better model translates directly into a smaller file.
 
-Decompression runs the same stages in reverse order.
+Decompression runs the identical model in lock-step with an arithmetic decoder to recover the BWT output, then inverts the BWT.
 
 ---
 
@@ -49,184 +51,160 @@ Decompression runs the same stages in reverse order.
 
 ### What it computes
 
-For a block `s` of length `n`, consider the `n` cyclic rotations `s[i..n) + s[0..i)`. Sort them lexicographically into a conceptual `n × n` matrix. The BWT output is the **last column** `L` of that matrix, plus the **primary index**: the row at which rotation 0 (the original block) landed.
+Take the block `s` (length `n`) and append a virtual sentinel `$` that sorts before every byte. Sort all rotations of `s$` into a conceptual matrix. The BWT is the **last column** `L` of that matrix.
 
 Example for `banana`:
 
 ```
- row  rotation   L
-  0   abanan  →  n
-  1   anaban  →  n
-  2   ananab  →  b
-  3   banana  →  a   ← primary index = 3
-  4   nabana  →  a
-  5   nanaba  →  a
+ row  rotation    L
+  0   $banana  →  a
+  1   a$banan  →  n
+  2   ana$ban  →  n
+  3   anana$b  →  b
+  4   banana$  →  $   ← primary index = 4
+  5   na$bana  →  a
+  6   nana$ba  →  a
 ```
 
-`L = "nnbaaa"`, primary index 3.
+`L = "annb$aa"`. The `$` carries no information except its position, so BWTSorter stores `L` without it (`"annbaa"`, exactly `n` bytes) together with the **primary index** 4.
 
-Each row is sorted by the text that *follows* its last character, so `L[i]` is the character that *precedes* the context at row `i`. In natural text, a given context is preceded by a small set of characters ("he " is very often preceded by "t"). Rows sharing a context are adjacent, so `L` consists of long stretches dominated by one or two symbols.
+Each row is sorted by the text that *follows* its last character, so `L[i]` is the character that *precedes* the context at row `i`. In real data a given context is preceded by a small set of characters ("he " is very often preceded by "t"). Rows sharing a context are adjacent, so `L` consists of long stretches dominated by one or two symbols.
 
-### How the rotations are sorted
+### Why a sentinel
 
-The matrix is never built. The program sorts an `int[]` of rotation start positions.
+Because `$` is unique and smallest, sorting the rotations of `s$` is the same as sorting the **suffixes** of `s$`. That turns the problem into suffix-array construction, which has fast, well-understood linear-time algorithms. It also removes the special case of periodic input (e.g. `abcabc…`), where plain rotations can be identical.
 
-The original implementation used a comparison sort with a character-by-character comparator. Each comparison costs up to the length of the common prefix of the two rotations, so the total is roughly *O(n log n · LCP)*. On repetitive input, which is precisely the input BWT is good at, the common prefixes are long and the sort degrades towards quadratic. 100 KB of zero bytes took about 39 seconds.
+### SA-IS: linear-time suffix sorting
 
-The current implementation uses **prefix doubling with radix sort** (the classic cyclic-shift suffix array construction):
+The suffix array is built with **SA-IS** (Nong, Zhang and Chan, 2009). The implementation follows the structure of the AtCoder Library.
 
-1. Counting-sort rotation indices by their first byte, and assign each a rank, its equivalence class by first byte.
-2. For `k = 1, 2, 4, …`: rotations are currently ordered by their first `k` bytes. The order by the first `2k` bytes is the order of the pairs `(rank[i], rank[(i + k) mod n])`.
-   - Shifting each sorted start back by `k` (`sa[i] − k mod n`) produces a list already sorted by the *second* element of the pair.
-   - A stable counting sort on the *first* element then gives the full pair order.
-   - New ranks are assigned by comparing adjacent pairs.
-3. Stop when every rank is distinct, or when `k ≥ n`.
+1. **Classify** each suffix as *S-type* (smaller than the suffix after it) or *L-type* (larger). This takes one right-to-left scan.
+2. **LMS positions.** Find the *left-most S* positions: S-type positions with an L-type position before them. They split the text into LMS substrings.
+3. **Induced sorting.** Drop the LMS suffixes into the ends of their first-character buckets. One left-to-right scan places every L-type suffix in order, and one right-to-left scan places every S-type suffix. This sorts the LMS *substrings* correctly.
+4. **Recursion.** Name each LMS substring by its rank. If all names are distinct, the LMS suffix order is known. Otherwise, solve the suffix array of the name string recursively; it is at most half as long.
+5. **Final induce.** Place the LMS suffixes in their now-correct order and induce once more. This yields the full suffix array.
 
-Each pass is O(n), and there are at most ⌈log₂ n⌉ passes, so the sort is **O(n log n) regardless of content**. All arithmetic is on `int[]`, with no boxing and no comparator lambdas, and the `mod n` is a conditional subtraction.
+Every step is linear, and each recursion level at least halves the input, so the total is **O(n)** regardless of content.
 
-**Periodic input.** If the block is periodic (e.g. `abcabc…`), some rotations are genuinely identical and keep tied ranks when the loop ends at `k ≥ n`. That is harmless: identical rotations have identical last characters, so the BWT does not depend on their order. And whichever tied row is recorded as the primary index, decoding from it reproduces a rotation equal to the original block.
+The implementation was checked against a brute-force sort on 20,000 random strings, including binary alphabets, where runs and repeats are most likely to trip up induced sorting.
+
+### Reading off the BWT
+
+With suffix array `SA` of `s` (the sentinel suffix is implicit as row 0):
+
+```
+L[0] = s[n−1]                     // row 0 is the suffix "$", preceded by s[n−1]
+for each SA[i]:
+    if SA[i] == 0: primary = i + 1   // the whole block, preceded by '$' (omitted)
+    else:          append s[SA[i] − 1]
+```
+
+### Why large blocks matter
+
+The previous, bzip2-style version used 900 KB blocks. Repeated material further apart than that, such as a file containing several versions of the same document or a mailbox quoting earlier messages, could not be seen as repeated. With 32 MB blocks, the suffix sort places every copy of a repeated passage next to every other copy, and the model codes the repeats for almost nothing. This was the biggest single source of improvement on large, redundant inputs.
 
 ---
 
-## 3. Stage 2: Move-To-Front
+## 3. Stage 2: Context-mixing model
 
-MTF keeps a list of all 256 byte values, initially in order. For each input byte it outputs the byte's current position in the list, then moves that byte to the front.
+Rather than transforming the BWT output further (the classic Move-To-Front + Huffman approach), BWTSorter predicts it directly, **one bit at a time**, most-significant bit first. For each bit the model outputs a 12-bit probability that the bit is 1.
 
-A stretch of `L` dominated by one character becomes a stretch of zeros. A stretch alternating between two characters becomes mostly 0s and 1s. On typical text, well over half of the MTF output is 0 and the vast majority is below 10.
+### Building blocks
 
-The implementation uses a linear search plus `System.arraycopy`. That is O(256) in the worst case per byte, but in practice the found index is tiny, so the cost is close to constant.
+**Stretch and squash.** Probabilities are combined in the *logistic* domain: `stretch(p) = ln(p / (1 − p))` and its inverse `squash`. Both are integer lookup tables (±2047 ↔ 0…4095), so the encoder and decoder compute bit-identical predictions on any machine.
 
----
+**StateMap.** This is an adaptive probability per context, stored as a 22-bit probability plus a 10-bit hit count in one `int`. After each bit, the probability moves toward the observed bit by `1 / (count + 1.5)`. New contexts therefore learn very fast (the first observation moves them two-thirds of the way). The count stops at a per-model **limit**, which sets how quickly a settled context can still adapt.
 
-## 4. Stage 3: Zero-run coding (RUNA/RUNB)
+**Mixer.** This is a gated linear mixer. It computes a weighted sum of the stretched input probabilities, squashes it back to a probability, and after each bit nudges every weight by `input × error × learning rate` (online gradient descent on coding cost). The set of weights used is selected by a small context, so the mixer can learn, for example, that the run model is trustworthy after a long run but not after a short one.
 
-Rather than Huffman-coding every MTF zero individually, runs of zeros are coded by their length using the scheme from bzip2.
+**APM / SSE.** An *adaptive probability map* takes an already-mixed probability and a context, and maps it through a learned curve (33 interpolation points along the stretch axis). It corrects systematic over- or under-confidence that the mixer can't express.
 
-A run of length `r ≥ 1` is written in **bijective base-2**, least-significant digit first, with two symbols:
+### The inputs
 
-- `RUNA` = digit 1
-- `RUNB` = digit 2
+| Input | Context | Limit | What it captures |
+|---|---|---|---|
+| order 0 | bits of current byte so far | 15 | overall symbol frequencies in the current region |
+| order 1 | previous byte + partial byte | 12 | "after an `e` comes…" within the current run of contexts |
+| order 2 | two previous bytes + partial byte | 8 | longer local patterns, such as alternating pairs |
+| run | previous byte, run-length bucket, partial byte | 127 | how likely a run of this symbol is to continue at this length |
+| run match | run-length bucket, the bit the previous byte predicts, partial byte (while still matching) | 255 | "does this byte repeat the last one?" as a dedicated question |
+| bias | constant | — | lets the mixer shift the overall estimate |
 
-```
-while r > 0:
-    if r is odd:  emit RUNA; r = (r − 1) / 2
-    else:         emit RUNB; r = (r − 2) / 2
-```
+Run length is bucketed into 16 levels: 0–7 exactly, then 8–15 in pairs, 16–63 in steps of 16, and 64+.
 
-| run length | symbols |
-|---|---|
-| 1 | RUNA |
-| 2 | RUNB |
-| 3 | RUNA RUNA |
-| 4 | RUNB RUNA |
-| 5 | RUNA RUNB |
-| 1000 | 9 symbols |
+The mixer's weight set is selected by **(run bucket, partial byte)**, which gives 4,096 weight sets of 6 weights. Its output then goes through two APMs:
 
-The decoder accumulates `run += digit × weight` with `weight` doubling at each step. The run ends at the first symbol that is neither `RUNA` nor `RUNB`.
+- `apm1`, keyed on order-1 context (previous byte + partial byte);
+- `apm2`, keyed on (run bucket, partial byte).
 
-Bijective numbering (no zero digit) means every run length has exactly one representation and no length needs to be stored separately. A run of length `r` costs about log₂ r symbols.
+The final probability is `(mixer + apm1 + 2 × apm2) / 4`, clamped to 1…4095.
 
-The final symbol alphabet has **258 symbols**:
+### Why these contexts
 
-| Symbol | Meaning |
-|---|---|
-| 0 | RUNA |
-| 1 | RUNB |
-| 2 … 256 | MTF value 1 … 255 (value + 1) |
-| 257 | EOB (end of block) |
+BWT output has a very particular structure. It is a sequence of **regions**, one per sorted context, each a few to a few thousand bytes long. Within a region, one or two symbols dominate. Between regions, the statistics change abruptly. That has two consequences:
 
-This stage replaces the original byte-pair RLE, which wrote a `(value, length)` pair for every run including runs of length 1. That doubled the size of non-repetitive data.
+- **Runs are the main signal.** The single best predictor of the next byte is "the same as the last one", with a confidence that depends on how long the run has been going. Two of the five models are devoted to this.
+- **Fast forgetting wins.** An order-1 model that remembers what followed `e` across the whole block is mostly wrong, because each region has its own answer. The tuned limits (8–15 for the order-n models) make these models track only the last few occurrences.
 
 ---
 
-## 5. Stage 4: Canonical Huffman coding
+## 4. Stage 3: Binary arithmetic coder
 
-### Building the code
-
-Symbol frequencies are counted over the whole block, and a Huffman tree is built with a priority queue. Ties are broken by node index, so the tree is deterministic.
-
-**Length limiting.** Code lengths are stored in 5 bits and capped at `MAX_CODE_LEN = 20`. If the optimal tree is deeper than that, which needs a very skewed distribution, every non-zero frequency is replaced by `1 + f/2` and the tree is rebuilt. This is the same flattening heuristic bzip2 uses. It is slightly sub-optimal compared with package-merge, but simple and effective, and in practice it rarely triggers.
-
-### Canonical codes
-
-Only the code **lengths** are transmitted. Codes are assigned canonically: sorted by (length, symbol), with each code one greater than the previous, left-shifted whenever the length increases:
+The coder keeps a 32-bit interval `[x1, x2]`. For each bit, with predicted probability `p` (12 bits) that it is a 1:
 
 ```
-code = 0
-for len in 1..20:
-    nextCode[len] = code
-    code = (code + count[len]) << 1
+xmid = x1 + ((x2 − x1) >> 12) × p
+if bit == 1:  x2 = xmid
+else:         x1 = xmid + 1
+while the top bytes of x1 and x2 are equal:
+    output that byte; shift both left by 8 (x2 gets 0xFF shifted in)
 ```
 
-Because the decoder can rebuild the exact same codes from the lengths alone, the code table costs only `258 × 5 = 1290 bits` (162 bytes) per block.
+The interval shrinks in proportion to the probability of what actually happened, so a bit costs about −log₂(p) bits of output. A bit predicted with 99.9% confidence costs about 0.0014 bits.
 
-### Decoding
+This is a *carry-less* coder (in the style of lpaq): once the top bytes of `x1` and `x2` agree, no later narrowing can change them, so they are emitted immediately. At the end, the four bytes of `x1` are flushed. The decoder mirrors the encoder exactly, holding the next 32 bits of the stream in `x` and comparing `x ≤ xmid` to recover each bit. Reads past the end of the payload return zero.
 
-The decoder uses the bit-at-a-time canonical method from zlib's `puff.c`. It reads one bit at a time and checks whether the code read so far falls within the range of codes of the current length:
-
-```
-code = first = index = 0
-for len in 1..20:
-    code |= nextBit()
-    if code − first < count[len]:
-        return sorted[index + code − first]
-    index += count[len]
-    first  = (first + count[len]) << 1
-    code <<= 1
-```
-
-`sorted[]` holds symbols in canonical order. This needs no tree and no lookup table, and invalid codes are detected when the loop runs out of lengths.
-
-### Bit order
-
-All bit I/O is **most-significant-bit first**. `BitWriter` accumulates bits in a `long` and flushes whole bytes. The final partial byte is padded with zero bits.
+The 12-bit probability limits the best case to about 1/4096, or 0.00035 bits per bit. That only matters on extremely redundant data, such as long runs of zeros. A 16-bit variant was tried and did worse overall (see §12).
 
 ---
 
-## 6. Stored-block fallback
+## 5. Stored-block fallback
 
-After coding, if `payload length + 8 ≥ block length`, the coded form is discarded and the block is written raw as a *stored* block. The 8 bytes are the primary index and the payload length, which a stored block doesn't need.
+After coding, if `payload length + 8 ≥ block length`, the coded form is discarded and the block is written raw. The 8 bytes are the primary index and the payload length, which a stored block doesn't need.
 
-This bounds the worst case. Incompressible input such as random, encrypted or already-compressed data grows by only **9 bytes per block** (type, length and CRC), plus the 6-byte file header and the 1-byte end marker. 200 KB of random data compresses to 200,015 bytes.
+This bounds the worst case. Incompressible input such as random, encrypted or already-compressed data grows by only **9 bytes per block**, plus the 6-byte file header and the 1-byte end marker.
 
 ---
 
-## 7. Decompression and the inverse BWT
+## 6. Decompression and the inverse BWT
 
-Decoding reverses the pipeline: Huffman decode, expand zero runs into the (already zero-filled) MTF array, inverse MTF, then inverse BWT.
+The decoder rebuilds the same model, decodes `n` bytes of BWT output bit by bit, then inverts the BWT in **O(n)**. The inversion relies on one key property:
 
-### The inverse BWT
+> The *k*-th occurrence of a character `c` in the last column is the same text position as the *k*-th occurrence of `c` in the first column.
 
-Given only `L` and the primary index, the original block can be rebuilt in **O(n)**. This relies on one key property:
-
-> The *k*-th occurrence of a character `c` in the last column `L` is the same text position as the *k*-th occurrence of `c` in the first column `F`.
-
-That holds because rows starting with `c` are sorted by what follows `c`, and so are the rows ending with `c`, by the same ordering.
-
-`F` is just `L` sorted, so it can be described by cumulative character counts. The program builds the **T-vector** (often called ψ):
+The first column is just the sorted last column, so it can be described by cumulative counts. Treat the stored bytes as an `(n + 1)`-entry last column with `$` re-inserted at the primary index. The first column then starts with `$` at row 0, followed by each byte value's range. Building the **T-vector** (ψ):
 
 ```
-count[c] = number of characters < c          (start of c's range in F)
-for i in 0..n−1:
-    next[count[L[i]]++] = i
+start[c] = 1 + (number of bytes < c)     // row 0 is '$'
+next[0]  = primary                        // '$' in F ↔ '$' in L
+for each row r ≠ primary, in order, with last byte c:
+    next[start[c]++] = r
 ```
 
-`next[j]` is the row whose *last* character is the same occurrence as the *first* character of row `j`.
-
-Row `p = primaryIndex` is rotation 0, whose first character is `s[0]`. `next[p]` is therefore the row whose last character is that `s[0]`. That row is rotation 1, because rotation 1 ends with `s[0]`. Following `next` repeatedly visits rotations 1, 2, 3, …, and the last character of rotation *r + 1* is `s[r]`:
+`next[j]` is the row whose *last* character is the same occurrence as the *first* character of row `j`. The primary row holds the whole block (rotation 0). Following `next` from it visits rotations 1, 2, 3, …, and the last character of rotation *k + 1* is `s[k]`:
 
 ```
-curr = primaryIndex
-for i in 0..n−1:
+curr = primary
+for k in 0..n−1:
     curr = next[curr]
-    original[i] = L[curr]
+    s[k] = last byte of row curr
 ```
 
-The walk produces the block **front to back**. (The first version of this program filled the output array from the end, which reversed every block. It went unnoticed because single-byte and all-identical blocks read the same both ways.)
+Using the `banana` example, this produces b, a, n, a, n, a.
 
 ---
 
-## 8. File format
+## 7. File format
 
 All multi-byte integers are **big-endian** (Java `DataOutputStream`).
 
@@ -235,28 +213,24 @@ All multi-byte integers are **big-endian** (Java `DataOutputStream`).
 | Offset | Size | Field |
 |---|---|---|
 | 0 | 4 | Magic: ASCII `BWTS` (`42 57 54 53`) |
-| 4 | 1 | Format version: `2` |
+| 4 | 1 | Format version: `3` |
 
 ### Blocks
 
-Blocks follow the header back to back. Every block starts with a one-byte type.
+Blocks follow the header back to back, each starting with a one-byte type.
 
-**End of stream** (type `0`)
-
-| Size | Field |
-|---|---|
-| 1 | `0` |
+**End of stream** (type `0`): the single byte `0`.
 
 **BWT-coded block** (type `1`)
 
 | Size | Field |
 |---|---|
 | 1 | `1` |
-| 4 | Original length `n` (1 … 900,000) |
+| 4 | Original length `n` (1 … 256,000,000) |
 | 4 | CRC-32 of the original bytes |
-| 4 | Primary index (0 … n − 1) |
-| 4 | Payload length in bytes |
-| *payload length* | Huffman bitstream (below) |
+| 4 | Primary index (1 … n) |
+| 4 | Payload length in bytes (< n) |
+| *payload length* | Arithmetic-coded BWT output (the model is reset at the start of every block) |
 
 **Stored block** (type `2`)
 
@@ -267,136 +241,188 @@ Blocks follow the header back to back. Every block starts with a one-byte type.
 | 4 | CRC-32 of the original bytes |
 | *n* | Raw bytes |
 
-### Huffman bitstream (inside a coded block)
-
-| Bits | Field |
-|---|---|
-| 258 × 5 | Code length for symbols 0 … 257, in symbol order (0 = unused) |
-| variable | Coded symbols, ending with EOB |
-| 0–7 | Zero padding to a byte boundary |
-
-An empty input file produces a 6-byte header followed by a lone end marker: 6 bytes in total.
-
-Version 1 files, from the original implementation, had no header and are not readable by version 2.
+Block size is not recorded in the header. Each block carries its own length, so the decoder doesn't need to know what block size the compressor used. An empty input produces just the header and the end marker: 6 bytes.
 
 ---
 
-## 9. Integrity and error handling
+## 8. Integrity and error handling
 
 The decoder validates input at every level and fails with a clear message and exit status 1. It never writes a block that fails its checks.
 
 | Check | Message |
 |---|---|
 | Missing or wrong magic number | `not a BWTSorter file (bad magic)` |
-| Unknown version | `unsupported format version N` |
+| Older or newer format version | `unsupported format version N (made by an older BWTSorter)` |
 | Length, primary index or payload length out of range | `corrupt block header` |
 | Unknown block type | `unknown block type N` |
-| Code length > 20 | `corrupt Huffman table` |
-| Bit pattern matches no code | `invalid Huffman code` |
-| Payload exhausted before EOB | `Huffman stream ended early` |
-| Decoded length ≠ declared length | `block overflows declared length` / `block shorter than declared length` |
 | CRC-32 mismatch | `CRC mismatch in block N - data is corrupt` |
 | Input ends mid-block or with no end marker | `unexpected end of file - compressed data is truncated` |
 
-Each block's CRC-32 (`java.util.zip.CRC32`) is computed over the *original* bytes. It catches any corruption that survives the structural checks, as well as bugs in the transform itself.
+An arithmetic-coded stream has no internal structure to violate: any bit sequence decodes to *something*. A damaged payload therefore decodes to garbage of the right length, and the **CRC-32** over the original bytes is what catches it. In testing, a single flipped bit in the middle of a payload was reported as a CRC mismatch.
 
 Blocks are written as they are verified. If a later block is corrupt, the output file will contain the earlier, verified blocks before the error is reported.
 
 ---
 
-## 10. Complexity and memory
+## 9. Complexity and memory
 
-Per block of `n` bytes:
-
-| Stage | Time | Working memory |
+| Stage | Time | Working memory (block of n bytes) |
 |---|---|---|
-| Rotation sort | O(n log n) | 4 `int[]` arrays ≈ 16n bytes |
-| BWT output, MTF | O(n) | 2n bytes |
-| Zero-run + Huffman encode | O(n) | `int[]` symbol stream ≈ 4n bytes |
-| Huffman decode | O(n · code length) | 2n bytes |
-| Inverse BWT | O(n) | `int[]` T-vector ≈ 4n bytes + 2n |
+| SA-IS suffix sort | O(n) | ≈ 13n bytes (text as `int[]`, SA, LMS map, type flags) + recursion ≤ 6.5n |
+| Context model + coder | O(n), ≈ 8 model evaluations per byte | ≈ 100 MB of tables, independent of n |
+| Inverse BWT | O(n) | ≈ 6n bytes (T-vector + two byte arrays) |
 
-At the 900 KB block size, peak heap use is roughly **20 MB when compressing** and **8 MB when decompressing**, well within JVM defaults. Memory does not grow with file size, because blocks are streamed one at a time.
+At the default 32 MB block size, compression runs within a **768 MB** heap (it fails at 512 MB) and decompression within **256 MB**. Java's default maximum heap is a quarter of physical memory, so a machine with 4 GB of RAM or more runs the default settings without adjustment. On smaller machines, use a smaller block size (`java BWTSorter -c in out 8`) or raise the heap (`java -Xmx2g …`). The program reports an out-of-memory condition with that advice rather than a stack trace.
+
+Unlike the sort, the model's cost is the same per byte regardless of content. It is the dominant cost in both directions, which is why decompression is about as slow as compression. That is the usual signature of context-mixing compressors, and the opposite of LZ-family tools like xz, which decompress many times faster than they compress.
 
 ---
 
-## 11. Benchmarks
+## 10. Benchmarks
 
-Measured on a Linux cloud VM with OpenJDK, including JVM start-up time. Every file was round-tripped and compared byte-for-byte.
+All results are on the **Silesia corpus**, the standard benchmark for general-purpose compressors: 12 files, 211.9 MB, covering English text, a dictionary, XML, source code, databases, executables, medical images and astronomical data. Each file was compressed and decompressed separately, and every BWTSorter output was compared byte-for-byte with the original. All 12 round-tripped correctly.
 
-| Input | Size | BWTSorter | bzip2 -9 | gzip -9 |
+The tools compared were BWTSorter with default settings (32 MB blocks, default JVM heap), `bzip2 -9`, and `xz -9e -T1` (xz's strongest preset, single-threaded). Everything ran on a 2-core Linux cloud VM with OpenJDK 21.
+
+### Compressed size (bytes; smallest in bold)
+
+| File | Contents | Original | BWTSorter | bzip2 -9 | xz -9e | vs xz |
+|---|---|---|---|---|---|---|
+| dickens | English novels | 10,192,446 | **2,254,513** | 2,799,520 | 2,831,212 | −20.4% |
+| mozilla | Tarred executables | 51,220,480 | 15,992,950 | 17,914,392 | **13,376,240** | +19.6% |
+| mr | MRI image | 9,970,564 | **2,112,249** | 2,441,280 | 2,751,892 | −23.2% |
+| nci | Chemical database | 33,553,445 | **1,235,199** | 1,812,734 | 1,449,272 | −14.8% |
+| ooffice | x86 DLL | 6,152,192 | 2,546,137 | 2,862,526 | **2,427,224** | +4.9% |
+| osdb | Database records | 10,085,684 | **2,194,465** | 2,802,792 | 2,844,556 | −22.9% |
+| reymont | Polish novel (PDF text) | 6,627,202 | **988,049** | 1,246,230 | 1,315,592 | −24.9% |
+| samba | Tarred source code | 21,606,400 | 3,943,855 | 4,549,759 | **3,739,524** | +5.5% |
+| sao | Star catalogue (binary) | 7,251,944 | 4,664,269 | 4,940,524 | **4,425,664** | +5.4% |
+| webster | Dictionary | 41,458,703 | **6,638,224** | 8,644,714 | 8,368,672 | −20.7% |
+| x-ray | X-ray image | 8,474,240 | **3,647,928** | 4,051,112 | 4,491,264 | −18.8% |
+| xml | XML documents | 5,345,280 | **392,043** | 441,186 | 434,892 | −9.9% |
+| **Total** | | **211,938,580** | **46,609,881** | 54,506,769 | 48,456,004 | **−3.8%** |
+
+Compression ratio over the whole corpus: **BWTSorter 4.55**, xz 4.37, bzip2 3.89.
+
+BWTSorter produces the smallest file on **8 of the 12** files. Its total is 14.5% smaller than bzip2's and 3.8% smaller than xz's.
+
+### Speed (whole corpus, seconds)
+
+| | Compress | Decompress |
+|---|---|---|
+| BWTSorter | 148 (1.4 MB/s) | 147 (1.4 MB/s) |
+| bzip2 -9 | 20 | — |
+| xz -9e | 205 | — |
+
+Decompression times for bzip2 and xz weren't measured. Typically bzip2 decompresses at roughly twice its compression speed, and xz at 50–100 MB/s.
+
+BWTSorter compresses faster than `xz -9e` but decompresses far more slowly, because its model must be re-run in full to decode (see §9). This is the standard trade-off of context-mixing compressors: a better ratio in exchange for symmetric, slower decoding.
+
+### Smaller synthetic tests
+
+| Input | Size | BWTSorter | bzip2 -9 | xz -9e |
 |---|---|---|---|---|
-| Java source repeated ×10 | 93,120 | 4,325 | 4,281 | 3,413 |
-| Random word prose | 2,689,604 | 534,079 | 455,072 | 702,631 |
-| Mixed binary | 2,012,000 | 302,409 | 303,992 | 305,387 |
-| Random bytes | 200,000 | 200,015 | 201,293 | 200,064 |
-| Zeros | 2,000,000 | 552 | 49 | 1,986 |
-| `abc` × 1000 | 3,000 | 191 | 45 | 54 |
-| Empty | 0 | 6 | 14 | 30 |
-| Mixed text corpus | 13,481,576 | 2,184,173 | 1,871,492 | — |
-
-Speed on the 13.5 MB corpus: **5.4 s to compress, 1.1 s to decompress**. bzip2 -9 took 1.4 s to compress.
-
-Before the rewrite, the original implementation took 54 s on the 93 KB file, expanded random data to 199% of its size, and failed to round-trip anything except single-byte and constant input.
+| Java source ×10 | 93,120 | 3,583 | 4,281 | 2,716 |
+| Random bytes | 200,000 | 200,015 | 201,293 | 200,072 |
+| `abc` × 1000 | 3,000 | 37 | 45 | 88 |
+| Empty file | 0 | 6 | 14 | 32 |
 
 ---
 
-## 12. Comparison with bzip2
+## 11. Why it beats xz on some files and not others
 
-BWTSorter follows bzip2's design closely but omits several refinements:
+**Where BWTSorter wins** (text, dictionaries, databases, images; 8 files, −10% to −25%): this data is dominated by *statistical* redundancy. Each symbol is fairly predictable from its immediate context, but long exact repeats are relatively rare. A BWT followed by a good adaptive model captures every context of every length at once. xz's LZ77 core can only exploit exact repeats; its literal and context coding (LZMA) is good, but not as good as a dedicated model on sorted contexts.
 
-| Feature | bzip2 | BWTSorter |
+**Where xz wins** (4 files):
+
+- **mozilla, ooffice** (executables, +5% to +20%). In machine code, the same call instruction to the same function encodes a *different* relative offset at each call site. That breaks up the contexts the BWT relies on. LZ matching with "repeat last offset" codes handles the structured, operand-heavy layout of code better. mozilla is also a tar of many dissimilar files, which favours LZ's ability to adapt instantly at file boundaries.
+- **samba** (source code tarball, +5.5%). Source trees contain many long exact duplicates (licence headers, repeated boilerplate, near-identical files) that LZ77 encodes as single cheap matches. BWT handles them well too, but pays a small cost at every point where a duplicated region's sorted contexts start and end.
+- **sao** (binary star catalogue, +5.4%). This consists of fixed-width records of floating-point numbers. The most useful context is often "the same field in the previous record" rather than the preceding bytes. LZ matching with repeated offsets can pick up some of that regularity; a BWT, which sorts by the bytes that immediately follow, largely loses it.
+
+---
+
+## 12. How the model was tuned
+
+The model's structure was designed up front; its parameters were then tuned empirically on the BWT output of eight Silesia files (the first 12 MB of each), measuring total coded size. Each change was kept only if it reduced the total.
+
+Changes were adopted in batches, and the total was measured at each checkpoint:
+
+| Checkpoint | 8-file total |
+|---|---|
+| Initial design (mixer learning rate 10; order-1 limit 1023, order-2 255) | 21,220,340 |
+| Mixer learning rate 16; order-1 limit 127 | 21,132,976 |
+| Order-1 limit 20; order-2 limit 60; run-map limits 127/255 | 20,889,761 |
+| Order-1 limit 12; order-2 limit 8; order-0 limit 15; final blend weights `apm2` × 2 | **20,502,958 (−3.4%)** |
+
+Things that were tried and rejected:
+
+| Variant | Result |
+|---|---|
+| Mixer learning rate 12, 20 or 24 | worse (+0.9% to +2.3%) |
+| Mixer weights selected by partial byte only | worse |
+| Mixer weights also selected by previous byte | worse (learns too slowly) |
+| 16-bit probabilities in the coder | worse (+0.6%) |
+| Dual-rate order-1 (fast + slow) | no gain |
+| Order-3 input | −0.09%, 25% slower, +64 MB |
+| Second mixer, averaged | −0.07%, 15% slower |
+
+The consistent lesson was **forget fast**. Almost every gain came from making the order-n models adapt more quickly, which reflects how BWT output is a sequence of short, statistically distinct regions.
+
+---
+
+## 13. Version history
+
+| Version | Pipeline | Silesia result |
 |---|---|---|
-| Block size | 100–900 KB (`-1`…`-9`) | fixed 900 KB |
-| Initial RLE (runs ≥ 4) | yes (RLE1) | no; not needed, since the sort is O(n log n) |
-| Rotation sort | tuned multi-key quicksort with fallback | prefix doubling + radix sort |
-| MTF symbol set | only symbols present in the block | all 256 |
-| Zero-run coding | RUNA/RUNB | RUNA/RUNB |
-| Huffman tables | 2–6 per block, chosen every 50 symbols | 1 per block |
-| Code-length header | symbol bitmap + delta-coded lengths | fixed 5 bits × 258 |
-| Integrity | per-block and whole-stream CRC | per-block CRC |
+| 1 (original) | Comparison-sort BWT, 100 KB blocks, MTF, byte-pair RLE | Did not round-trip (inverse BWT reversed each block); quadratic sort on repetitive data |
+| 2 | Prefix-doubling BWT, 900 KB blocks, MTF, RUNA/RUNB, single Huffman table | About 15% larger than bzip2 on large text |
+| 3 (current) | SA-IS BWT, 32 MB blocks, context mixing, arithmetic coding | 3.8% smaller than xz -9e and 14.5% smaller than bzip2 -9 on the whole corpus |
 
-The ~15% gap on large text comes almost entirely from the **single Huffman table**. The statistics of MTF output vary across a block: dense, highly repetitive regions alternate with sparser ones. bzip2's multiple tables, selected per 50-symbol group and refined iteratively, adapt to that. The gap on tiny or ultra-repetitive inputs comes from the fixed **162-byte** code-length header, which bzip2 typically shrinks to a few dozen bytes.
+Each version's format is incompatible with the others, and the decoder rejects older files with a clear message.
 
 ---
 
-## 13. Limitations and possible extensions
+## 14. Limitations and possible extensions
 
-In rough order of payoff:
-
-1. **Multiple Huffman tables.** Split the symbol stream into 50-symbol groups, maintain 2–6 tables, assign each group to the table that codes it most cheaply, re-estimate the tables from their assigned groups, and iterate a few times. Store the table selection per group (bzip2 MTF-codes the selectors too). This should close most of the gap to bzip2.
-2. **Compact code-length header.** Write a 258-bit (or two-level) presence bitmap, then delta-code each used symbol's length against the previous one (`0` = same, `10` = +1, `11` = −1). This saves 100+ bytes per block, which matters for small files.
-3. **Reduced MTF alphabet.** Map only the bytes present in the block, so MTF indices start smaller.
-4. **Selectable block size**, e.g. `-1` … `-9`, trading ratio for memory.
-5. **Faster sort.** SA-IS or divsufsort (applied to the doubled string) would bring the sort to O(n) and narrow the compression-speed gap with bzip2.
-6. **Parallelism.** Blocks are independent, so both compression and decompression parallelise trivially across cores, as in `pbzip2`.
-7. **Stream support.** Accept `-` for stdin/stdout so the tool can sit in a shell pipeline.
-8. **Whole-stream CRC** in the end marker, to detect blocks being dropped or reordered.
+1. **Speed.** About 1.4 MB/s in each direction, single-threaded. The 64 MB order-2 table causes a cache miss on most bits. Blocks are independent, so compressing several blocks in parallel would scale almost linearly with cores. Within a block, the model could also be split across threads by coding separate segments with separate models, at a small cost in ratio.
+2. **Executable code.** x86 machine code compresses poorly with any BWT, because relative branch addresses make identical calls look different. xz handles this better, and has an optional filter (`--x86`) that converts addresses to absolute form first. A similar E8/E9 filter in front of the BWT would help on `ooffice`- and `mozilla`-like data.
+3. **Structured binary data** (tables of fixed-width records, images such as `x-ray`, audio). Delta or record-aware filters before the BWT can help considerably.
+4. **Richer modelling.** An order-3 input and a second mixer each gained under 0.1% for a 15–25% slowdown. Further gains would come from bigger changes: modelling ranks rather than bytes (as bsc's QLFC does), or two-pass parameter optimisation per block.
+5. **Stream support.** Accepting `-` for stdin and stdout would let the tool sit in a shell pipeline.
+6. **Whole-stream CRC** in the end marker, to detect blocks being dropped or reordered.
 
 ---
 
-## 14. Code map
+## 15. Code map
 
 | Method / class | Role |
 |---|---|
-| `main`, `printUsage` | Command-line handling |
+| `main`, `printUsage` | Command-line handling, block size option, timing, memory advice |
 | `compress`, `compressBlock` | Header, block loop, coded-vs-stored decision |
-| `transformBWT`, `sortRotations` | BWT via prefix-doubling rotation sort |
-| `transformMTF` | Move-to-front encode |
-| `entropyEncode` | Zero-run coding, frequency count, Huffman output |
-| `huffmanLengths`, `buildTreeLengths` | Length-limited Huffman code lengths |
-| `canonicalCodes` | Canonical code assignment |
+| `transformBWT` | BWT with virtual sentinel, read off the suffix array |
+| `SuffixArray.build`, `induce` | SA-IS suffix array construction |
+| `Logistic` | Integer stretch/squash tables |
+| `StateMap` | Adaptive per-context probabilities with hit counts |
+| `APM` | Secondary estimation (interpolated probability refinement) |
+| `Predictor` | Context selection, mixer, APM chain |
+| `ArithmeticCoder.encode` / `decode` | Carry-less binary arithmetic coder driven by `Predictor` |
 | `decompress` | Header and block parsing, validation, CRC check |
-| `entropyDecode`, `decodeSymbol` | Huffman decode and zero-run expansion |
-| `inverseMTF` | Move-to-front decode |
-| `inverseBWT` | O(n) reconstruction via the T-vector |
-| `BitWriter`, `BitReader` | MSB-first bit I/O |
+| `inverseBWT` | O(n) reconstruction via the T-vector with sentinel |
+
+---
+
+## Credits
+
+- **Mario Gianota** — architect
+- **Claude** (an AI model by Anthropic) — implementation and documentation
 
 ---
 
 ## References
 
 - M. Burrows and D. J. Wheeler, *A Block-sorting Lossless Data Compression Algorithm*, DEC SRC Research Report 124, 1994.
-- J. Seward, *bzip2 and libbzip2* — source code and format.
-- U. Manber and G. Myers, *Suffix Arrays: A New Method for On-Line String Searches*, 1990 (prefix doubling).
-- M. Adler, `puff.c` in the zlib distribution — canonical Huffman decoding.
+- G. Nong, S. Zhang and W. H. Chan, *Two Efficient Algorithms for Linear Time Suffix Array Construction*, IEEE Transactions on Computers, 2011 (SA-IS).
+- AtCoder Library, `string.hpp` — reference SA-IS implementation.
+- M. Mahoney, *Data Compression Explained* — context mixing, StateMaps, mixers and APMs; the lpaq compressor.
+- I. Grebnov, *libbsc* — modern block-sorting compression.
+- S. Deorowicz, *Silesia compression corpus*.

@@ -88,7 +88,7 @@ To find out, BWTSorter was tested against the most popular compression programs 
 
 | Program | Where you might have met it | All 12 files compressed to |
 |---|---|---|
-| **BWTSorter** | this program | **46.3 MB** 🏆 |
+| **BWTSorter** | this program | **45.9 MB** 🏆 |
 | bzip3 | the newer successor to bzip2, BWTSorter's closest relative | 46.4 MB |
 | bsc | specialist tool from the same family | 46.8 MB |
 | 7-Zip (PPMd mode) | the 7-Zip app, "PPMd" option | 47.7 MB |
@@ -112,11 +112,12 @@ To find out, BWTSorter was tested against the most popular compression programs 
 | Medical scan (MRI) | 10.0 MB | **2.11 MB** | 2.75 MB | 2.75 MB | 3.67 MB |
 | XML documents | 5.3 MB | **0.39 MB** | 0.46 MB | 0.43 MB | 0.66 MB |
 | Program source code | 21.6 MB | 3.86 MB | 3.76 MB | **3.74 MB** | 5.41 MB |
-| Program files (Firefox) | 51.2 MB | 15.8 MB | **13.3 MB** | 13.4 MB | 19.0 MB |
+| A Windows program library (DLL) | 6.2 MB | **2.14 MB** | 2.43 MB | 2.43 MB | 3.09 MB |
+| Program files (Mozilla web browser, for an older Alpha processor) | 51.2 MB | 15.8 MB | **13.3 MB** | 13.4 MB | 19.0 MB |
 
 (7-Zip is shown in its normal mode. The "zip" column is gzip, which uses the same method as `.zip` files.)
 
-BWTSorter is especially good with text, data and images. It's less good with program files (apps and libraries), where 7-Zip and xz do better.
+BWTSorter is especially good with text, data and images. It recognises programs written for ordinary PCs (x86 processors) automatically and rearranges them so they compress better, which is why it wins on the Windows library above. It's less good with some other kinds of program files, such as programs for other processors and modern 64-bit Linux programs, where 7-Zip and xz still do better.
 
 Photos, music, videos and `.zip` files will come out about the same size, which is normal. These are *already* compressed, so there's nothing left to squeeze.
 
@@ -148,13 +149,15 @@ Error processing file: not a BWTSorter file (bad magic)
 
 - **It works on one file at a time.** To compress a whole folder, first put it in a single file (for example with your Mac's *Compress* option, or `tar`), then compress that.
 - **Compressed files can only be opened with BWTSorter.** Other programs such as zip tools won't recognise the `.bwts` format.
-- **Older compressed files.** This version (4) opens files made by version 3. Files made by versions 1 and 2 won't open; decompress them with the version that made them.
+- **Older compressed files.** This version (5) opens files made by versions 3 and 4. Files made by versions 1 and 2 won't open; decompress them with the version that made them.
 
 ---
 
 ## How does it work, in plain English?
 
-First, BWTSorter looks for long passages that repeat word for word, at least 112 characters long, and replaces each repeat with a short note that says "same again". The rest of the work then has less to get through.
+First, if the file is a program for an ordinary PC, BWTSorter tidies it up: programs refer to the same places over and over, but write each reference differently depending on where it appears, so BWTSorter rewrites them in a consistent form that repeats.
+
+Then it looks for long passages that repeat word for word, at least 112 characters long, and replaces each repeat with a short note that says "same again". The rest of the work then has less to get through.
 
 Next, imagine taking a page of text and writing it out over and over, each copy starting one letter later, until you've started at every letter. Then sort all those copies into alphabetical order, and read down the *last* letter of each one.
 

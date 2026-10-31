@@ -12,6 +12,9 @@ import java.util.zip.CRC32;
  * stream bit by bit for an arithmetic coder.
  *
  * COMPRESSION PIPELINE (per block, 32 MB by default):
+ *  -  x86 filter. If the block looks like x86 machine code, the relative addresses in
+ *     CALL and JMP instructions are converted to absolute ones, so that repeated calls
+ *     to the same function become identical byte strings.
  *  0. LZP preprocessing. Repeats of 112 bytes or more, predicted from the previous four
  *     bytes, are replaced by a short marker. Used only when it makes the block smaller.
  *  1. Burrows-Wheeler Transform. The suffix array of the block is built with SA-IS
@@ -27,18 +30,20 @@ import java.util.zip.CRC32;
  *  4. If the coded block would not be smaller than the raw block (random or
  *     already-compressed data), the block is stored uncompressed instead.
  *
- * FILE FORMAT (version 4; version 3 files are also read, as they are a subset):
+ * FILE FORMAT (version 5; version 3 and 4 files are also read, as they are subsets):
  *   "BWTS" magic, 1 version byte, then a sequence of blocks:
- *     type byte: 0 = end of stream, 1 = BWT-coded, 2 = stored, 3 = LZP + BWT-coded
+ *     type byte: 0 = end of stream, 1 = BWT-coded, 2 = stored, 3 = LZP + BWT-coded,
+ *                4 = x86 + BWT-coded, 5 = x86 + LZP + BWT-coded
  *     int  original length
  *     int  CRC32 of the original bytes
- *     LZP + BWT-coded: int LZP length, then as BWT-coded
+ *     types 3 and 5: int LZP length, then as BWT-coded
  *     BWT-coded: int primary index, int payload length, payload (arithmetic-coded)
  *     stored:    raw bytes
  *
  * DECOMPRESSION runs the same model in lock-step to decode the BWT output, inverts the
- * BWT in O(n) by following the T-vector (psi mapping) from the primary index, and expands
- * any LZP markers. Each block's CRC32 is verified before it is written.
+ * BWT in O(n) by following the T-vector (psi mapping) from the primary index, expands
+ * any LZP markers and reverses the x86 filter. Each block's CRC32 is verified before it
+ * is written.
  *
  * CREDITS:
  *   Mario Gianota - architect
@@ -49,13 +54,15 @@ public class BWTSorter {
     private static final int DEFAULT_BLOCK_MB = 32;
     private static final int MAX_BLOCK_MB = 256;
     private static final byte[] MAGIC = "BWTS".getBytes(StandardCharsets.US_ASCII);
-    private static final int VERSION = 4;
-    private static final int OLDEST_READABLE_VERSION = 3;   // version 3 files are a subset of version 4
+    private static final int VERSION = 5;
+    private static final int OLDEST_READABLE_VERSION = 3;   // versions 3 and 4 are subsets of version 5
 
     private static final int BLOCK_END = 0;
     private static final int BLOCK_BWT = 1;
     private static final int BLOCK_STORED = 2;
-    private static final int BLOCK_BWT_LZP = 3;
+    private static final int BLOCK_BWT_LZP = 3;          // version 4+
+    private static final int BLOCK_X86_BWT = 4;          // version 5+
+    private static final int BLOCK_X86_BWT_LZP = 5;      // version 5+
 
     public static void main(String[] args) {
         if (args.length < 3) {
@@ -143,8 +150,15 @@ public class BWTSorter {
         crc.update(block);
         int checksum = (int) crc.getValue();
 
-        byte[] lzp = LZP.encode(block);
-        byte[] source = lzp != null ? lzp : block;
+        // x86 code first, so that LZP can catch the repeats the filter creates.
+        boolean x86 = X86.looksLikeX86(block);
+        byte[] filtered = block;
+        if (x86) {
+            filtered = block.clone();
+            X86.apply(filtered, true);
+        }
+        byte[] lzp = LZP.encode(filtered);
+        byte[] source = lzp != null ? lzp : filtered;
 
         BWTResult bwt = transformBWT(source);
         byte[] payload = ArithmeticCoder.encode(bwt.bwtBlock);
@@ -153,7 +167,9 @@ public class BWTSorter {
         // plus the LZP length when LZP was used.
         int extra = lzp != null ? 12 : 8;
         if ((long) payload.length + extra < n) {
-            out.writeByte(lzp != null ? BLOCK_BWT_LZP : BLOCK_BWT);
+            int type = x86 ? (lzp != null ? BLOCK_X86_BWT_LZP : BLOCK_X86_BWT)
+                           : (lzp != null ? BLOCK_BWT_LZP : BLOCK_BWT);
+            out.writeByte(type);
             out.writeInt(n);
             out.writeInt(checksum);
             if (lzp != null) out.writeInt(lzp.length);
@@ -243,8 +259,10 @@ public class BWTSorter {
                     if (type == BLOCK_STORED) {
                         original = new byte[length];
                         in.readFully(original);
-                    } else if (type == BLOCK_BWT || (type == BLOCK_BWT_LZP && version >= 4)) {
-                        boolean lzp = type == BLOCK_BWT_LZP;
+                    } else if (type == BLOCK_BWT || (type == BLOCK_BWT_LZP && version >= 4)
+                            || ((type == BLOCK_X86_BWT || type == BLOCK_X86_BWT_LZP) && version >= 5)) {
+                        boolean lzp = type == BLOCK_BWT_LZP || type == BLOCK_X86_BWT_LZP;
+                        boolean x86 = type == BLOCK_X86_BWT || type == BLOCK_X86_BWT_LZP;
                         int sortedLen = lzp ? in.readInt() : length;
                         int primaryIndex = in.readInt();
                         int payloadLen = in.readInt();
@@ -258,6 +276,7 @@ public class BWTSorter {
                         byte[] bwt = ArithmeticCoder.decode(payload, sortedLen);
                         byte[] sorted = inverseBWT(bwt, primaryIndex);
                         original = lzp ? LZP.decode(sorted, length) : sorted;
+                        if (x86) X86.apply(original, false);
                     } else {
                         throw new IOException("unknown block type " + type);
                     }
@@ -310,6 +329,81 @@ public class BWTSorter {
             original[k] = bwt[curr < primaryIndex ? curr : curr - 1];
         }
         return original;
+    }
+
+    // =========================================================================
+    // X86 FILTER
+    // =========================================================================
+
+    /**
+     * Makes x86 machine code more repetitive before it is sorted.
+     *
+     * A CALL (opcode E8) or JMP (E9) is followed by a 4-byte little-endian offset relative
+     * to the next instruction. Every call to the same function therefore stores a
+     * different number, so identical instructions look different. Adding the position
+     * turns each offset into the target's absolute address, and calls to the same function
+     * become identical byte strings.
+     *
+     * Only plausible offsets are converted: those whose top byte is 00 or FF (|offset| below
+     * 16 MB). The result is kept to the same 25-bit signed range, so its top byte is again
+     * 00 or FF and the decoder recognises exactly the same places.
+     *
+     * After ANY E8/E9 opcode the next four bytes are skipped, converted or not. That keeps
+     * the scan identical on both sides: a conversion can never change a byte that the
+     * decoder reads to make an earlier decision.
+     */
+    static final class X86 {
+        // Plausible call/jump sites per KB at or above which a block is treated as x86 code.
+        // Measured: x86 programs 12-29; blocks only 10-25% x86 code about 3, and the filter
+        // still helped them (-2.5% to -8.7%); non-x86 data at most 0.7 (Silesia's Alpha
+        // executables, where the filter hurts); random data 0.06.
+        static final int MIN_SITES_PER_KB = 2;
+
+        private static boolean opcode(byte b) {
+            return b == (byte) 0xE8 || b == (byte) 0xE9;
+        }
+
+        private static boolean plausible(byte top) {
+            return top == 0 || top == (byte) 0xFF;
+        }
+
+        /** True if the block looks like x86 code: enough plausible call/jump sites. */
+        static boolean looksLikeX86(byte[] b) {
+            int n = b.length;
+            if (n < 4096) return false;
+            long sites = 0;
+            for (int i = 0; i + 4 < n; ) {
+                if (opcode(b[i])) {
+                    if (plausible(b[i + 4])) sites++;
+                    i += 5;
+                } else {
+                    i++;
+                }
+            }
+            return sites * 1024 >= (long) MIN_SITES_PER_KB * n;
+        }
+
+        /** Relative offsets to absolute addresses (encode) or back (decode), in place. */
+        static void apply(byte[] b, boolean encode) {
+            int n = b.length;
+            for (int i = 0; i + 4 < n; ) {
+                if (!opcode(b[i])) {
+                    i++;
+                    continue;
+                }
+                if (plausible(b[i + 4])) {
+                    int v = (b[i + 1] & 0xFF) | (b[i + 2] & 0xFF) << 8 | (b[i + 3] & 0xFF) << 16 | (b[i + 4] & 0xFF) << 24;
+                    int pos = i + 5;
+                    v = encode ? v + pos : v - pos;
+                    v = (v << 7) >> 7;                        // sign-extend from 25 bits
+                    b[i + 1] = (byte) v;
+                    b[i + 2] = (byte) (v >>> 8);
+                    b[i + 3] = (byte) (v >>> 16);
+                    b[i + 4] = (byte) (v >>> 24);
+                }
+                i += 5;
+            }
+        }
     }
 
     // =========================================================================

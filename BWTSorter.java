@@ -1,6 +1,12 @@
 import java.io.*;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayDeque;
 import java.util.Arrays;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.zip.CRC32;
 
 /**
@@ -39,6 +45,10 @@ import java.util.zip.CRC32;
  *     types 3 and 5: int LZP length, then as BWT-coded
  *     BWT-coded: int primary index, int payload length, payload (arithmetic-coded)
  *     stored:    raw bytes
+ *
+ * THREADS: blocks are independent, so several are compressed or decompressed at once,
+ * one per core, as far as Java's memory limit allows. The output is identical whatever
+ * the number of threads.
  *
  * DECOMPRESSION runs the same model in lock-step to decode the BWT output, inverts the
  * BWT in O(n) by following the T-vector (psi mapping) from the primary index, expands
@@ -107,8 +117,8 @@ public class BWTSorter {
             System.err.println("Error processing file: " + e.getMessage());
             System.exit(1);
         } catch (OutOfMemoryError e) {
-            System.err.println("Not enough memory for this block size. Try a smaller block size "
-                    + "(e.g. 8) or give Java more memory with: java -Xmx2g BWTSorter ...");
+            System.err.println("Not enough memory. Try a smaller block size (e.g. 8) "
+                    + "or give Java more memory with: java -Xmx4g BWTSorter ...");
             System.exit(1);
         }
     }
@@ -123,28 +133,124 @@ public class BWTSorter {
     }
 
     // =========================================================================
+    // THREADS
+    // =========================================================================
+
+    /** How many blocks to work on at once, and the worker threads that do it. */
+    static final class Threads {
+        private static final long MB = 1L << 20;
+
+        // Peak memory per block in flight. Measured: compressing a 32 MB block fits in a
+        // 704 MB heap but not 640 MB; decompressing one fits in 192 MB but not 160 MB.
+        // These estimates leave a margin above those figures.
+        static long compressMemory(int blockBytes) {
+            return 21L * blockBytes + 96 * MB;
+        }
+
+        static long decompressMemory(int blockBytes) {
+            return 5L * blockBytes + 48 * MB;
+        }
+
+        /**
+         * One thread per core, but no more than there are blocks, and no more blocks in
+         * flight than fit in 90% of Java's memory limit. When memory rather than cores is
+         * the limit, and report is set, it says so and how to lift it.
+         */
+        static int plan(int blocks, long perBlock, boolean report) {
+            int cores = Runtime.getRuntime().availableProcessors();
+            int wanted = Math.max(1, Math.min(cores, blocks));
+            long budget = Runtime.getRuntime().maxMemory() / 10 * 9;
+            int fits = (int) Math.max(1, Math.min(Integer.MAX_VALUE, budget / perBlock));
+            int threads = Math.min(wanted, fits);
+            if (report) {
+                System.out.printf("%d block%s, %d thread%s%n",
+                        blocks, blocks == 1 ? "" : "s", threads, threads == 1 ? "" : "s");
+                if (threads < wanted) {
+                    long gigabytes = (wanted * perBlock / 9 * 10 + (1L << 30) - 1) >> 30;
+                    System.out.printf("(Memory allows %d block%s at a time. To use all %d cores, run with "
+                                    + "more memory, e.g. java -Xmx%dg BWTSorter ..., or use a smaller block size.)%n",
+                            threads, threads == 1 ? "" : "s", wanted, gigabytes);
+                }
+            }
+            return threads;
+        }
+
+        static ExecutorService pool(int threads) {
+            return Executors.newFixedThreadPool(threads, task -> {
+                Thread t = new Thread(task, "BWTSorter-worker");
+                t.setDaemon(true);
+                return t;
+            });
+        }
+
+        /** The task's result, with any failure it raised re-thrown here. */
+        static <T> T await(Future<T> future) throws IOException {
+            try {
+                return future.get();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("interrupted");
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof IOException) throw (IOException) cause;
+                if (cause instanceof Error) throw (Error) cause;
+                if (cause instanceof RuntimeException) throw (RuntimeException) cause;
+                throw new IOException(cause);
+            }
+        }
+    }
+
+    // =========================================================================
     // COMPRESSION ENGINE
     // =========================================================================
 
+    /**
+     * Compresses blocks in parallel, one per thread, and writes them in order.
+     *
+     * Blocks are independent (the model starts afresh in each), so the output is
+     * byte-for-byte the same whatever the number of threads. At most `threads` blocks are
+     * in memory at once, which is what keeps memory use bounded.
+     */
     public static void compress(File inFile, File outFile, int blockSize) throws IOException {
+        long fileLength = inFile.length();
+        // Don't allocate a 32 MB buffer for a 2 KB file.
+        int bufferSize = (int) Math.max(1, Math.min(blockSize, fileLength));
+        int blocks = (int) Math.max(1, (fileLength + blockSize - 1) / blockSize);
+        int threads = Threads.plan(blocks, Threads.compressMemory(bufferSize), true);
+
+        ExecutorService pool = Threads.pool(threads);
         try (InputStream in = new BufferedInputStream(new FileInputStream(inFile), 1 << 16);
              DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(outFile), 1 << 16))) {
 
             out.write(MAGIC);
             out.writeByte(VERSION);
 
-            // Don't allocate a 32 MB buffer for a 2 KB file.
-            int bufferSize = (int) Math.max(1, Math.min(blockSize, inFile.length()));
-            byte[] buffer = new byte[bufferSize];
-            int bytesRead;
-            while ((bytesRead = in.readNBytes(buffer, 0, buffer.length)) > 0) {
-                compressBlock(Arrays.copyOf(buffer, bytesRead), out);
+            ArrayDeque<Future<byte[]>> pending = new ArrayDeque<>();
+            boolean endOfInput = false;
+            while (true) {
+                while (!endOfInput && pending.size() < threads) {
+                    byte[] buffer = new byte[bufferSize];
+                    int bytesRead = in.readNBytes(buffer, 0, buffer.length);
+                    if (bytesRead <= 0) {
+                        endOfInput = true;
+                        break;
+                    }
+                    byte[] block = bytesRead == buffer.length ? buffer : Arrays.copyOf(buffer, bytesRead);
+                    pending.add(pool.submit(() -> compressBlock(block)));
+                }
+                if (pending.isEmpty()) break;
+                out.write(Threads.await(pending.poll()));    // oldest first, so blocks stay in order
             }
             out.writeByte(BLOCK_END);
+        } finally {
+            pool.shutdownNow();
         }
     }
 
-    private static void compressBlock(byte[] block, DataOutputStream out) throws IOException {
+    /** One block, fully encoded: its header and its payload (or its raw bytes). */
+    private static byte[] compressBlock(byte[] block) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream(block.length / 3 + 64);
+        DataOutputStream out = new DataOutputStream(bytes);
         int n = block.length;
         CRC32 crc = new CRC32();
         crc.update(block);
@@ -182,6 +288,8 @@ public class BWTSorter {
             out.writeInt(checksum);
             out.write(block);
         }
+        out.flush();
+        return bytes.toByteArray();
     }
 
     // --- BWT Transformation (Sorting Phase) ---
@@ -244,55 +352,102 @@ public class BWTSorter {
                         + (version < VERSION ? " (made by an older BWTSorter)" : " (made by a newer BWTSorter)"));
             }
 
-            int maxBlock = MAX_BLOCK_MB * 1_000_000;
+            // Headers are read and checked here, in file order; the expensive decoding of
+            // each block runs on a worker thread, and results are written in order.
+            ExecutorService pool = null;
+            int threads = 1;
+            ArrayDeque<Future<byte[]>> pending = new ArrayDeque<>();
             try {
-                int blockNo = 0;
-                while (true) {
-                    int type = in.readUnsignedByte();
-                    if (type == BLOCK_END) break;
-
-                    int length = in.readInt();
-                    int checksum = in.readInt();
-                    if (length <= 0 || length > maxBlock) throw new IOException("corrupt block header (length " + length + ")");
-
-                    byte[] original;
-                    if (type == BLOCK_STORED) {
-                        original = new byte[length];
-                        in.readFully(original);
-                    } else if (type == BLOCK_BWT || (type == BLOCK_BWT_LZP && version >= 4)
-                            || ((type == BLOCK_X86_BWT || type == BLOCK_X86_BWT_LZP) && version >= 5)) {
-                        boolean lzp = type == BLOCK_BWT_LZP || type == BLOCK_X86_BWT_LZP;
-                        boolean x86 = type == BLOCK_X86_BWT || type == BLOCK_X86_BWT_LZP;
-                        int sortedLen = lzp ? in.readInt() : length;
-                        int primaryIndex = in.readInt();
-                        int payloadLen = in.readInt();
-                        if ((lzp && sortedLen < 4) || sortedLen > length || primaryIndex < 1 || primaryIndex > sortedLen
-                                || payloadLen <= 0 || payloadLen >= length) {
-                            throw new IOException("corrupt block header");
+                for (int blockNo = 0; ; blockNo++) {
+                    PendingBlock block;
+                    try {
+                        block = readBlock(in, version, blockNo);
+                    } catch (IOException e) {
+                        // Write the blocks already read (each is verified) before reporting.
+                        drain(pending, out);
+                        if (e instanceof EOFException) {
+                            throw new IOException("unexpected end of file - compressed data is truncated");
                         }
-                        byte[] payload = new byte[payloadLen];
-                        in.readFully(payload);
-
-                        byte[] bwt = ArithmeticCoder.decode(payload, sortedLen);
-                        byte[] sorted = inverseBWT(bwt, primaryIndex);
-                        original = lzp ? LZP.decode(sorted, length) : sorted;
-                        if (x86) X86.apply(original, false);
-                    } else {
-                        throw new IOException("unknown block type " + type);
+                        throw e;
                     }
-
-                    CRC32 crc = new CRC32();
-                    crc.update(original);
-                    if ((int) crc.getValue() != checksum) {
-                        throw new IOException("CRC mismatch in block " + blockNo + " - data is corrupt");
+                    if (block == null) break;
+                    if (pool == null) {
+                        threads = Threads.plan(Integer.MAX_VALUE, Threads.decompressMemory(block.length), false);
+                        pool = Threads.pool(threads);
                     }
-                    out.write(original);
-                    blockNo++;
+                    while (pending.size() >= threads) out.write(Threads.await(pending.poll()));
+                    pending.add(pool.submit(block.work));
                 }
-            } catch (EOFException e) {
-                throw new IOException("unexpected end of file - compressed data is truncated");
+                drain(pending, out);
+            } finally {
+                if (pool != null) pool.shutdownNow();
             }
         }
+    }
+
+    /** A block read from the file, with the work that will decode and verify it. */
+    private static final class PendingBlock {
+        final int length;
+        final Callable<byte[]> work;
+
+        PendingBlock(int length, Callable<byte[]> work) {
+            this.length = length;
+            this.work = work;
+        }
+    }
+
+    private static void drain(ArrayDeque<Future<byte[]>> pending, OutputStream out) throws IOException {
+        while (!pending.isEmpty()) out.write(Threads.await(pending.poll()));
+    }
+
+    /** Reads one block's header and data, or returns null at the end-of-stream marker. */
+    private static PendingBlock readBlock(DataInputStream in, int version, int blockNo) throws IOException {
+        int type = in.readUnsignedByte();
+        if (type == BLOCK_END) return null;
+
+        int length = in.readInt();
+        int checksum = in.readInt();
+        if (length <= 0 || length > MAX_BLOCK_MB * 1_000_000) {
+            throw new IOException("corrupt block header (length " + length + ")");
+        }
+
+        if (type == BLOCK_STORED) {
+            byte[] original = new byte[length];
+            in.readFully(original);
+            return new PendingBlock(length, () -> verified(original, checksum, blockNo));
+        }
+        if (type == BLOCK_BWT || (type == BLOCK_BWT_LZP && version >= 4)
+                || ((type == BLOCK_X86_BWT || type == BLOCK_X86_BWT_LZP) && version >= 5)) {
+            boolean lzp = type == BLOCK_BWT_LZP || type == BLOCK_X86_BWT_LZP;
+            boolean x86 = type == BLOCK_X86_BWT || type == BLOCK_X86_BWT_LZP;
+            int sortedLen = lzp ? in.readInt() : length;
+            int primaryIndex = in.readInt();
+            int payloadLen = in.readInt();
+            if ((lzp && sortedLen < 4) || sortedLen > length || primaryIndex < 1 || primaryIndex > sortedLen
+                    || payloadLen <= 0 || payloadLen >= length) {
+                throw new IOException("corrupt block header");
+            }
+            byte[] payload = new byte[payloadLen];
+            in.readFully(payload);
+
+            return new PendingBlock(length, () -> {
+                byte[] bwt = ArithmeticCoder.decode(payload, sortedLen);
+                byte[] sorted = inverseBWT(bwt, primaryIndex);
+                byte[] original = lzp ? LZP.decode(sorted, length) : sorted;
+                if (x86) X86.apply(original, false);
+                return verified(original, checksum, blockNo);
+            });
+        }
+        throw new IOException("unknown block type " + type);
+    }
+
+    private static byte[] verified(byte[] original, int checksum, int blockNo) throws IOException {
+        CRC32 crc = new CRC32();
+        crc.update(original);
+        if ((int) crc.getValue() != checksum) {
+            throw new IOException("CRC mismatch in block " + blockNo + " - data is corrupt");
+        }
+        return original;
     }
 
     /**

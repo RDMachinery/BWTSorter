@@ -66,6 +66,23 @@ java BWTSorter -c myfile.txt myfile.bwts 8
 
 You don't need to remember the block size to decompress; the compressed file records everything it needs. If your computer runs short of memory, BWTSorter will say so and suggest a smaller block size.
 
+### Using all your computer's cores
+
+BWTSorter works on several blocks at once, one per processor core, so files bigger than one block (32 MB) compress and decompress faster on a multi-core Mac. When it starts, it tells you how many blocks it found and how many it is working on at a time:
+
+```
+Compressing via BWT Block-Sorting...
+7 blocks, 4 threads
+```
+
+Each block being compressed needs about 770 MB of memory, and Java normally lets a program use only a quarter of your computer's memory. So on some machines BWTSorter will use fewer cores than you have, and it will tell you, suggesting a command like this:
+
+```
+java -Xmx8g BWTSorter -c myfile.txt myfile.bwts
+```
+
+`-Xmx8g` allows Java to use up to 8 GB. Choosing a smaller block size also lets more blocks run at once, at a small cost in compression. Either way, the compressed file comes out exactly the same however many cores are used.
+
 ## Getting the file back (decompressing)
 
 ```
@@ -123,7 +140,7 @@ Photos, music, videos and `.zip` files will come out about the same size, which 
 
 ### The catch: speed
 
-BWTSorter handles about 1.4 MB per second, both when compressing and when restoring. A 10 MB document takes about 7 seconds each way, and the whole 212 MB test collection took about 2½ minutes each way.
+BWTSorter handles about 1.4 MB per second on each core, both when compressing and when restoring. A 10 MB document takes about 7 seconds each way. Bigger files go faster on a multi-core computer: on a 2-core machine, a 212 MB file took 99 seconds to compress instead of 182, and 82 seconds to restore instead of 141. More cores help more, as long as the file has enough blocks to share out.
 
 That's similar to other programs at their strongest settings when compressing (faster than xz and brotli, in fact), but much slower when restoring: programs like zip, xz and 7-Zip unpack files in a second or two. BWTSorter gets its extra squeeze by doing careful prediction work in both directions. That makes it best suited to archiving, where you compress something once and rarely need it back, rather than files you open every day.
 

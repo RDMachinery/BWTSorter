@@ -2,7 +2,7 @@
 
 This document describes how BWTSorter works internally: the compression pipeline, the algorithms behind each stage, the on-disk format, the design trade-offs, and how it compares with other compressors, bzip3 and bsc in particular. It is aimed at developers and the curious. For usage instructions, see [README.md](README.md).
 
-BWTSorter is a single-file Java program (`BWTSorter.java`, about 950 lines, no dependencies beyond the JDK). It is a block-sorting compressor, related to `bzip2` but with a modern pipeline: an x86 filter and LZP preprocessing, a linear-time suffix sort, large blocks, and a context-mixing model driving an arithmetic coder. This places it in the same family as `bzip3`, `bsc` and `bcm`; on the Silesia corpus it produces the smallest total of all the compressors tested (§11).
+BWTSorter is a single-file Java program (`BWTSorter.java`, about 1,100 lines, no dependencies beyond the JDK). It is a block-sorting compressor, related to `bzip2` but with a modern pipeline: an x86 filter and LZP preprocessing, a linear-time suffix sort, large blocks, and a context-mixing model driving an arithmetic coder. This places it in the same family as `bzip3`, `bsc` and `bcm`; on the Silesia corpus it produces the smallest total of all the compressors tested (§11).
 
 ---
 
@@ -30,7 +30,7 @@ BWTSorter is a single-file Java program (`BWTSorter.java`, about 950 lines, no d
 
 ## 1. Pipeline overview
 
-Input is split into blocks, **32 MB by default** (configurable from 1 to 256 MB), and each block is compressed independently.
+Input is split into blocks, **32 MB by default** (configurable from 1 to 256 MB), and each block is compressed independently. Several blocks are worked on at once, as many as there are cores and memory allows (§10).
 
 ```
            ┌────────────┐   ┌──────────┐   ┌───────────────┐   ┌──────────────────────┐   ┌────────────┐
@@ -371,6 +371,30 @@ Blocks are written as they are verified. If a later block is corrupt, the output
 
 At the default 32 MB block size (rechecked with LZP), compression runs within a **768 MB** heap (it fails at 512 MB) and decompression within **256 MB**. Java's default maximum heap is a quarter of physical memory, so a machine with 4 GB of RAM or more runs the default settings without adjustment. On smaller machines, use a smaller block size (`java BWTSorter -c in out 8`) or raise the heap (`java -Xmx2g …`). The program reports an out-of-memory condition with that advice rather than a stack trace.
 
+### Threads and memory
+
+Blocks share nothing (the model starts afresh in each), so they are compressed and decompressed in parallel on a pool of worker threads. The main thread reads blocks in order, hands each to a worker, and writes the results strictly in order. The output is therefore byte-for-byte identical whatever the number of threads, which was checked on single- and multi-block files.
+
+The number of threads is the smallest of three numbers: the cores available, the number of blocks, and how many blocks fit in 90% of Java's memory limit at once. The per-block allowances leave a margin above measured peaks (a 32 MB block compressed in a 704 MB heap but not 640 MB, and decompressed in 192 MB but not 160 MB):
+
+| | Memory allowed per block in flight | At 32 MB blocks |
+|---|---|---|
+| Compressing | 21 × block size + 96 MB | ≈ 770 MB |
+| Decompressing | 5 × block size + 48 MB | ≈ 210 MB |
+
+Java's default limit is a quarter of physical memory, so at the default block size an 8 GB Mac compresses up to 2 blocks at a time and a 16 GB Mac up to 5, cores permitting. When memory rather than cores is the limit, the program says so and suggests a heap size, for example `java -Xmx8g BWTSorter …`. A smaller block size also lets more blocks run at once. Decompression needs far less memory, so it normally uses every core.
+
+Measured on a 2-core VM, with the whole Silesia corpus joined into one 212 MB file (7 blocks):
+
+| | 1 thread | 2 threads | Speed-up |
+|---|---|---|---|
+| Compress (3 GB heap) | 181.7 s | 98.6 s | 1.84× |
+| Decompress (default heap) | 141.1 s | 81.6 s | 1.73× |
+
+With more cores the gain continues, up to the number of blocks: a file smaller than one block uses one core. If a block fails its checks during decompression, every block before it is still written out in order before the error is reported, as in the single-threaded version.
+
+### Cost per byte
+
 Unlike the sort, the model's cost is the same per byte regardless of content. It is the dominant cost in both directions, which is why decompression is about as slow as compression. That is the usual signature of context-mixing compressors, and the opposite of LZ-family tools like xz, which decompress many times faster than they compress.
 
 ---
@@ -381,7 +405,7 @@ All results are on the **Silesia corpus**, the standard benchmark for general-pu
 
 ### The contenders
 
-Each tool was run at its strongest standard setting and **single-threaded**, since BWTSorter is single-threaded.
+Each tool was run at its strongest standard setting and **single-threaded**, BWTSorter included, so that the speeds compare like with like (BWTSorter's multi-core speed-up is in §10).
 
 | Tool | Version | Setting | Family |
 |---|---|---|---|
@@ -492,7 +516,7 @@ bzip3 (Kamila Szewczyk, 2022) is BWTSorter's nearest relative. BWTSorter's model
 | Combining them | Fixed formula, `((p0 + p1)×7 + 2×p2) / 16` | Learning mixer, with weight sets chosen by run length and partial byte |
 | Refinement | 1 APM (partial byte × "run longer than 2") | 2 APMs (order-1 context; run length in 16 levels × partial byte) |
 | Counters | Fixed-rate shifts | Hit-counted: new contexts learn fast, then settle |
-| Threads | Several blocks in parallel (`-j`) | One |
+| Threads | Several blocks in parallel (`-j`, set by the user) | Several blocks in parallel (chosen automatically from cores and memory) |
 
 BWTSorter's richer run modelling and learning mixer pay off where the BWT output is dominated by runs: nci (−10.8% against bzip3), xml (−3.9%), osdb (−3.0%). Its x86 filter, which bzip3 lacks, adds ooffice (−15.3%). bzip3's simpler, faster model holds a small edge on large natural-language text (0.2–0.7%). The 5× speed difference is mostly the model: bzip3 does about three table lookups and one APM per bit, BWTSorter five lookups, a mixer and two APMs, and in Java rather than C.
 
@@ -578,7 +602,7 @@ The threshold of 2 call sites per KB sits in the gap between the measurements in
 | 2 | Prefix-doubling BWT, 900 KB blocks, MTF, RUNA/RUNB, single Huffman table | About 15% larger than bzip2 on large text |
 | 3 | SA-IS BWT, 32 MB blocks, context mixing, arithmetic coding | 46,609,881 bytes: smaller than bsc, PPMd, xz, brotli and zstd; level with bzip3 |
 | 4 | Version 3 + LZP preprocessing | 46,335,329 bytes (−0.59%), and about 8–10% faster; smaller in total than bzip3 at every setting tested |
-| 5 (current) | Version 4 + automatic x86 filter | 45,940,478 bytes (−0.85%; ooffice −15.6%): smallest total of all 15 configurations tested (§11) |
+| 5 (current) | Version 4 + automatic x86 filter; blocks compressed and decompressed in parallel (no format change) | 45,940,478 bytes (−0.85%; ooffice −15.6%): smallest total of all 15 configurations tested (§11) |
 
 Versions 1, 2 and 3 have incompatible formats, and the decoder rejects files from versions 1 and 2 with a clear message. Version 5 reads files from versions 3 and 4.
 
@@ -586,7 +610,7 @@ Versions 1, 2 and 3 have incompatible formats, and the decoder rejects files fro
 
 ## 16. Limitations and possible extensions
 
-1. **Speed.** About 1.4 MB/s in each direction, single-threaded: about five times slower than bzip3 and ten times slower than bsc. The 64 MB order-2 table causes a cache miss on most bits. Blocks are independent, so compressing several blocks in parallel would scale almost linearly with cores. Within a block, the model could also be split across threads by coding separate segments with separate models, at a small cost in ratio.
+1. **Speed.** About 1.4 MB/s per core in each direction: about five times slower than bzip3 and ten times slower than bsc, core for core. The 64 MB order-2 table causes a cache miss on most bits. Several blocks already run in parallel (§10), but a file of one block uses one core; splitting a block's model across threads, by coding separate segments with separate models, would help those at a small cost in ratio.
 2. **64-bit x86 code.** The CALL/JMP filter covers what matters most in 32-bit code. 64-bit code also addresses data relative to the current instruction (RIP-relative operands), which the filter leaves alone; converting those needs an instruction-length decoder. Splitting call targets into a separate stream, as 7-Zip's BCJ2 does, is another option.
 3. **Other processors.** xz ships filters for ARM, ARM64, PowerPC, SPARC, IA-64 and RISC-V code; the same idea applies to each. Mozilla's Alpha code would need its own.
 4. **Segmentation.** Splitting a mixed block where its content changes gained bsc 1.8% on mozilla and 2.7% on ooffice, but cost 2.5% on samba, so it would have to be kept only where it helps.
@@ -603,6 +627,7 @@ Versions 1, 2 and 3 have incompatible formats, and the decoder rejects files fro
 | Method / class | Role |
 |---|---|
 | `main`, `printUsage` | Command-line handling, block size option, timing, memory advice |
+| `Threads` | Thread count from cores, blocks and memory; worker pool; error passing |
 | `compress`, `compressBlock` | Header, block loop, x86, LZP and coded-vs-stored decisions |
 | `X86.looksLikeX86`, `X86.apply` | x86 detection, and the CALL/JMP filter in both directions |
 | `LZP.encode` / `decode` | LZP preprocessing and its inverse |
@@ -613,7 +638,7 @@ Versions 1, 2 and 3 have incompatible formats, and the decoder rejects files fro
 | `APM` | Secondary estimation (interpolated probability refinement) |
 | `Predictor` | Context selection, mixer, APM chain |
 | `ArithmeticCoder.encode` / `decode` | Carry-less binary arithmetic coder driven by `Predictor` |
-| `decompress` | Header and block parsing (versions 3 to 5), validation, CRC check |
+| `decompress`, `readBlock`, `verified` | Header and block parsing (versions 3 to 5) in order, parallel decoding, CRC check |
 | `inverseBWT` | O(n) reconstruction via the T-vector with sentinel |
 
 ---

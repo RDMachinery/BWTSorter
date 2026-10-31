@@ -12,6 +12,8 @@ import java.util.zip.CRC32;
  * stream bit by bit for an arithmetic coder.
  *
  * COMPRESSION PIPELINE (per block, 32 MB by default):
+ *  0. LZP preprocessing. Repeats of 112 bytes or more, predicted from the previous four
+ *     bytes, are replaced by a short marker. Used only when it makes the block smaller.
  *  1. Burrows-Wheeler Transform. The suffix array of the block is built with SA-IS
  *     (linear time), and the BWT is read off it. A virtual end-of-block sentinel makes
  *     the rotations unambiguous; its row is stored as the "primary index". Large blocks
@@ -25,17 +27,18 @@ import java.util.zip.CRC32;
  *  4. If the coded block would not be smaller than the raw block (random or
  *     already-compressed data), the block is stored uncompressed instead.
  *
- * FILE FORMAT (version 3):
+ * FILE FORMAT (version 4; version 3 files are also read, as they are a subset):
  *   "BWTS" magic, 1 version byte, then a sequence of blocks:
- *     type byte: 0 = end of stream, 1 = BWT-coded, 2 = stored
+ *     type byte: 0 = end of stream, 1 = BWT-coded, 2 = stored, 3 = LZP + BWT-coded
  *     int  original length
  *     int  CRC32 of the original bytes
+ *     LZP + BWT-coded: int LZP length, then as BWT-coded
  *     BWT-coded: int primary index, int payload length, payload (arithmetic-coded)
  *     stored:    raw bytes
  *
- * DECOMPRESSION runs the same model in lock-step to decode the BWT output, then inverts
- * the BWT in O(n) by following the T-vector (psi mapping) from the primary index. Each
- * block's CRC32 is verified before it is written.
+ * DECOMPRESSION runs the same model in lock-step to decode the BWT output, inverts the
+ * BWT in O(n) by following the T-vector (psi mapping) from the primary index, and expands
+ * any LZP markers. Each block's CRC32 is verified before it is written.
  *
  * CREDITS:
  *   Mario Gianota - architect
@@ -46,11 +49,13 @@ public class BWTSorter {
     private static final int DEFAULT_BLOCK_MB = 32;
     private static final int MAX_BLOCK_MB = 256;
     private static final byte[] MAGIC = "BWTS".getBytes(StandardCharsets.US_ASCII);
-    private static final int VERSION = 3;
+    private static final int VERSION = 4;
+    private static final int OLDEST_READABLE_VERSION = 3;   // version 3 files are a subset of version 4
 
     private static final int BLOCK_END = 0;
     private static final int BLOCK_BWT = 1;
     private static final int BLOCK_STORED = 2;
+    private static final int BLOCK_BWT_LZP = 3;
 
     public static void main(String[] args) {
         if (args.length < 3) {
@@ -138,14 +143,20 @@ public class BWTSorter {
         crc.update(block);
         int checksum = (int) crc.getValue();
 
-        BWTResult bwt = transformBWT(block);
+        byte[] lzp = LZP.encode(block);
+        byte[] source = lzp != null ? lzp : block;
+
+        BWTResult bwt = transformBWT(source);
         byte[] payload = ArithmeticCoder.encode(bwt.bwtBlock);
 
-        // 8 extra bytes (primary index + payload length) for a coded block.
-        if ((long) payload.length + 8 < n) {
-            out.writeByte(BLOCK_BWT);
+        // Extra bytes beyond the common header: primary index + payload length,
+        // plus the LZP length when LZP was used.
+        int extra = lzp != null ? 12 : 8;
+        if ((long) payload.length + extra < n) {
+            out.writeByte(lzp != null ? BLOCK_BWT_LZP : BLOCK_BWT);
             out.writeInt(n);
             out.writeInt(checksum);
+            if (lzp != null) out.writeInt(lzp.length);
             out.writeInt(bwt.primaryIndex);
             out.writeInt(payload.length);
             out.write(payload);
@@ -212,9 +223,9 @@ public class BWTSorter {
             }
             if (!Arrays.equals(magic, MAGIC)) throw new IOException("not a BWTSorter file (bad magic)");
             int version = in.readUnsignedByte();
-            if (version != VERSION) {
+            if (version < OLDEST_READABLE_VERSION || version > VERSION) {
                 throw new IOException("unsupported format version " + version
-                        + (version < VERSION ? " (made by an older BWTSorter)" : ""));
+                        + (version < VERSION ? " (made by an older BWTSorter)" : " (made by a newer BWTSorter)"));
             }
 
             int maxBlock = MAX_BLOCK_MB * 1_000_000;
@@ -232,17 +243,21 @@ public class BWTSorter {
                     if (type == BLOCK_STORED) {
                         original = new byte[length];
                         in.readFully(original);
-                    } else if (type == BLOCK_BWT) {
+                    } else if (type == BLOCK_BWT || (type == BLOCK_BWT_LZP && version >= 4)) {
+                        boolean lzp = type == BLOCK_BWT_LZP;
+                        int sortedLen = lzp ? in.readInt() : length;
                         int primaryIndex = in.readInt();
                         int payloadLen = in.readInt();
-                        if (primaryIndex < 1 || primaryIndex > length || payloadLen <= 0 || payloadLen >= length) {
+                        if ((lzp && sortedLen < 4) || sortedLen > length || primaryIndex < 1 || primaryIndex > sortedLen
+                                || payloadLen <= 0 || payloadLen >= length) {
                             throw new IOException("corrupt block header");
                         }
                         byte[] payload = new byte[payloadLen];
                         in.readFully(payload);
 
-                        byte[] bwt = ArithmeticCoder.decode(payload, length);
-                        original = inverseBWT(bwt, primaryIndex);
+                        byte[] bwt = ArithmeticCoder.decode(payload, sortedLen);
+                        byte[] sorted = inverseBWT(bwt, primaryIndex);
+                        original = lzp ? LZP.decode(sorted, length) : sorted;
                     } else {
                         throw new IOException("unknown block type " + type);
                     }
@@ -295,6 +310,134 @@ public class BWTSorter {
             original[k] = bwt[curr < primaryIndex ? curr : curr - 1];
         }
         return original;
+    }
+
+    // =========================================================================
+    // LZP PREPROCESSING
+    // =========================================================================
+
+    /**
+     * Lempel-Ziv Prediction: removes long repeated strings before the BWT.
+     *
+     * At each position the previous 4 bytes are hashed into a table that remembers where
+     * that context was last seen. That position is the prediction: if the text there
+     * matches the text here for at least MIN_MATCH bytes, the whole repeat is replaced by
+     * a MATCH marker and its length. No offset is stored, because the decoder sees the
+     * same context and makes the same prediction.
+     *
+     * Why it helps a BWT: a passage repeated k times puts k copies of every one of its
+     * contexts side by side after sorting. Each copy is cheap, but not free, and the
+     * places where the copies start and end cost real bits. Removing the repeats outright
+     * is cheaper. Short repeats are left alone, because the BWT and the model already
+     * handle them better than a marker would.
+     *
+     * Encoding:
+     *   literal byte b             -> b
+     *   literal MATCH, predicted   -> MATCH, 255   (escaped only when a prediction exists,
+     *                                               since only then can the decoder misread it)
+     *   repeat of length L         -> MATCH, then L - MIN_MATCH as bytes of 254 followed by
+     *                                 a final byte 0..253
+     * Positions inside a repeat are not added to the table; the decoder skips them too.
+     */
+    static final class LZP {
+        static final int MATCH = 0xF2;
+        // Tuned on the Silesia corpus: 32 hurt and 40 (bzip3's choice) barely helped, because
+        // the model already handles medium repeats better than a marker; 96-160 were best.
+        static final int MIN_MATCH = 112;
+        static final int HASH_BITS = 20;                 // 4 MB table; 2^22 gained 0.006%
+
+        private static int hash(int ctx) {
+            return (ctx * 0x9E3779B1) >>> (32 - HASH_BITS);
+        }
+
+        private static int context(byte[] b, int end) {
+            return ((b[end - 4] & 0xFF) << 24) | ((b[end - 3] & 0xFF) << 16)
+                    | ((b[end - 2] & 0xFF) << 8) | (b[end - 1] & 0xFF);
+        }
+
+        /** The LZP form of in, or null if it would not be smaller. */
+        static byte[] encode(byte[] in) {
+            int n = in.length;
+            if (n < MIN_MATCH + 8) return null;
+            byte[] out = new byte[n];
+            int[] table = new int[1 << HASH_BITS];      // 0 = context not seen yet
+            int limit = n - 4;                          // room for the largest single step
+            System.arraycopy(in, 0, out, 0, 4);
+            int i = 4, o = 4;
+            int ctx = context(in, 4);
+
+            while (i < n) {
+                if (o >= limit) return null;
+                int h = hash(ctx);
+                int ref = table[h];
+                table[h] = i;
+                // A repeat long enough to use must agree at its last required byte, so test
+                // that one first: most candidates fail there without a byte-by-byte scan.
+                if (ref > 0 && i + MIN_MATCH <= n && in[ref + MIN_MATCH - 1] == in[i + MIN_MATCH - 1]) {
+                    int len = 0, max = n - i;
+                    while (len < max && in[ref + len] == in[i + len]) len++;
+                    if (len >= MIN_MATCH) {
+                        out[o++] = (byte) MATCH;
+                        int v = len - MIN_MATCH;
+                        while (v >= 254) {
+                            if (o >= limit) return null;
+                            out[o++] = (byte) 254;
+                            v -= 254;
+                        }
+                        out[o++] = (byte) v;
+                        i += len;
+                        ctx = context(in, i);
+                        continue;
+                    }
+                }
+                int b = in[i++] & 0xFF;
+                out[o++] = (byte) b;
+                if (b == MATCH && ref > 0) out[o++] = (byte) 255;
+                ctx = (ctx << 8) | b;
+            }
+            return Arrays.copyOf(out, o);
+        }
+
+        /** Expands an LZP stream back to exactly length bytes. */
+        static byte[] decode(byte[] in, int length) throws IOException {
+            if (in.length < 4 || length < 4) throw new IOException("corrupt LZP stream");
+            byte[] out = new byte[length];
+            int[] table = new int[1 << HASH_BITS];
+            System.arraycopy(in, 0, out, 0, 4);
+            int p = 4, o = 4;
+            int ctx = context(out, 4);
+
+            while (o < length) {
+                if (p >= in.length) throw new IOException("LZP stream ended early");
+                int h = hash(ctx);
+                int ref = table[h];
+                table[h] = o;
+                int b = in[p++] & 0xFF;
+                if (b == MATCH && ref > 0) {
+                    if (p >= in.length) throw new IOException("LZP stream ended early");
+                    int c = in[p++] & 0xFF;
+                    if (c != 255) {
+                        long len = MIN_MATCH;
+                        while (true) {
+                            len += c;
+                            if (c != 254) break;
+                            if (p >= in.length) throw new IOException("LZP stream ended early");
+                            c = in[p++] & 0xFF;
+                        }
+                        if (o + len > length) throw new IOException("LZP repeat overruns the block");
+                        // Byte by byte: the source may overlap what is being written.
+                        for (int k = 0; k < len; k++) out[o + k] = out[ref + k];
+                        o += (int) len;
+                        ctx = context(out, o);
+                        continue;
+                    }
+                }
+                out[o++] = (byte) b;
+                ctx = (ctx << 8) | b;
+            }
+            if (p != in.length) throw new IOException("LZP stream has trailing data");
+            return out;
+        }
     }
 
     // =========================================================================

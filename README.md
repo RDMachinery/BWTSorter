@@ -51,7 +51,7 @@ When it finishes, it tells you the before and after sizes:
 
 ```
 Compressing via BWT Block-Sorting...
-Compression Complete -> myfile.bwts (10192446 -> 2254513 bytes, 6.47s)
+Compression Complete -> myfile.bwts (10192446 -> 2246292 bytes, 6.93s)
 ```
 
 Your original file is left untouched.
@@ -88,8 +88,9 @@ To find out, BWTSorter was tested against the most popular compression programs 
 
 | Program | Where you might have met it | All 12 files compressed to |
 |---|---|---|
-| **BWTSorter** | this program | **46.6 MB** 🏆 |
-| bsc | specialist tool, the strongest of BWTSorter's relatives | 46.8 MB |
+| **BWTSorter** | this program | **46.3 MB** 🏆 |
+| bzip3 | the newer successor to bzip2, BWTSorter's closest relative | 46.4 MB |
+| bsc | specialist tool from the same family | 46.8 MB |
 | 7-Zip (PPMd mode) | the 7-Zip app, "PPMd" option | 47.7 MB |
 | xz | `.tar.xz` downloads on Mac and Linux | 48.5 MB |
 | 7-Zip (normal mode) | `.7z` files | 48.8 MB |
@@ -99,19 +100,19 @@ To find out, BWTSorter was tested against the most popular compression programs 
 | gzip / zip | `.gz` and ordinary `.zip` files | 67.6 MB |
 | lz4 | games and databases, where speed matters most | 77.4 MB |
 
-**BWTSorter came first**, a whisker ahead of bsc and comfortably ahead of everything most people use day to day. The same files take up about **30% less space** than as ordinary `.zip` files.
+**BWTSorter came first**, a whisker ahead of its close relatives bzip3 and bsc, and comfortably ahead of everything most people use day to day. The same files take up about **30% less space** than as ordinary `.zip` files.
 
 ### File by file
 
 | Type of file | Original | BWTSorter | 7-Zip | xz | zip |
 |---|---|---|---|---|---|
 | Novels by Charles Dickens | 10.2 MB | **2.25 MB** | 2.83 MB | 2.83 MB | 3.85 MB |
-| An English dictionary | 41.5 MB | **6.64 MB** | 8.39 MB | 8.37 MB | 12.06 MB |
+| An English dictionary | 41.5 MB | **6.63 MB** | 8.39 MB | 8.37 MB | 12.06 MB |
 | A database | 10.1 MB | **2.19 MB** | 2.85 MB | 2.84 MB | 3.72 MB |
 | Medical scan (MRI) | 10.0 MB | **2.11 MB** | 2.75 MB | 2.75 MB | 3.67 MB |
 | XML documents | 5.3 MB | **0.39 MB** | 0.46 MB | 0.43 MB | 0.66 MB |
-| Program source code | 21.6 MB | 3.94 MB | 3.76 MB | **3.74 MB** | 5.41 MB |
-| Program files (Firefox) | 51.2 MB | 16.0 MB | **13.3 MB** | 13.4 MB | 19.0 MB |
+| Program source code | 21.6 MB | 3.86 MB | 3.76 MB | **3.74 MB** | 5.41 MB |
+| Program files (Firefox) | 51.2 MB | 15.8 MB | **13.3 MB** | 13.4 MB | 19.0 MB |
 
 (7-Zip is shown in its normal mode. The "zip" column is gzip, which uses the same method as `.zip` files.)
 
@@ -147,13 +148,15 @@ Error processing file: not a BWTSorter file (bad magic)
 
 - **It works on one file at a time.** To compress a whole folder, first put it in a single file (for example with your Mac's *Compress* option, or `tar`), then compress that.
 - **Compressed files can only be opened with BWTSorter.** Other programs such as zip tools won't recognise the `.bwts` format.
-- **Compressed files from older versions of BWTSorter won't open.** The format changed in version 3. If you have files made with an older version, decompress them with that version first.
+- **Older compressed files.** This version (4) opens files made by version 3. Files made by versions 1 and 2 won't open; decompress them with the version that made them.
 
 ---
 
 ## How does it work, in plain English?
 
-Imagine taking a page of text and writing it out over and over, each copy starting one letter later, until you've started at every letter. Then sort all those copies into alphabetical order, and read down the *last* letter of each one.
+First, BWTSorter looks for long passages that repeat word for word, at least 112 characters long, and replaces each repeat with a short note that says "same again". The rest of the work then has less to get through.
+
+Next, imagine taking a page of text and writing it out over and over, each copy starting one letter later, until you've started at every letter. Then sort all those copies into alphabetical order, and read down the *last* letter of each one.
 
 That last column has a curious property. Because the copies are sorted by what comes *after* each letter, letters that tend to appear before the same things get grouped together. Every letter that comes just before "he " (often a "t") ends up next to the others. The jumbled text turns into long stretches of repeated letters, and repetition is easy to describe briefly.
 
